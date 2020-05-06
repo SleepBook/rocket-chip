@@ -3,22 +3,25 @@
 package freechips.rocketchip.diplomacy
 
 import Chisel._
+import chisel3.util.{IrrevocableIO,ReadyValidIO}
 import freechips.rocketchip.util.{ShiftQueue, RationalDirection, FastToSlow, AsyncQueueParams}
+import scala.reflect.ClassTag
 
-/** Options for memory regions */
+/** Options for describing the attributes of memory regions */
 object RegionType {
   // Define the 'more relaxed than' ordering
-  val cases = Seq(CACHED, TRACKED, UNCACHED, UNCACHEABLE, PUT_EFFECTS, GET_EFFECTS)
+  val cases = Seq(CACHED, TRACKED, UNCACHED, IDEMPOTENT, VOLATILE, PUT_EFFECTS, GET_EFFECTS)
   sealed trait T extends Ordered[T] {
     def compare(that: T): Int = cases.indexOf(that) compare cases.indexOf(this)
   }
 
-  case object CACHED      extends T
-  case object TRACKED     extends T
-  case object UNCACHED    extends T // not cached yet, but could be
-  case object UNCACHEABLE extends T // may spontaneously change contents
-  case object PUT_EFFECTS extends T // PUT_EFFECTS => UNCACHEABLE
-  case object GET_EFFECTS extends T // GET_EFFECTS => PUT_EFFECTS
+  case object CACHED      extends T // an intermediate agent may have cached a copy of the region for you
+  case object TRACKED     extends T // the region may have been cached by another master, but coherence is being provided
+  case object UNCACHED    extends T // the region has not been cached yet, but should be cached when possible
+  case object IDEMPOTENT  extends T // gets return most recently put content, but content should not be cached
+  case object VOLATILE    extends T // content may change without a put, but puts and gets have no side effects
+  case object PUT_EFFECTS extends T // puts produce side effects and so must not be combined/delayed
+  case object GET_EFFECTS extends T // gets produce side effects and so must not be issued speculatively
 }
 
 // A non-empty half-open range; [start, end)
@@ -58,7 +61,7 @@ case class IdRange(start: Int, end: Int) extends Ordered[IdRange]
   def shift(x: Int) = IdRange(start+x, end+x)
   def size = end - start
   def isEmpty = end == start
-  
+
   def range = start until end
 }
 
@@ -90,18 +93,31 @@ case class TransferSizes(min: Int, max: Int)
     else { UInt(log2Ceil(min)) <= x && x <= UInt(log2Ceil(max)) }
 
   def contains(x: TransferSizes) = x.none || (min <= x.min && x.max <= max)
-  
+
   def intersect(x: TransferSizes) =
     if (x.max < min || max < x.min) TransferSizes.none
     else TransferSizes(scala.math.max(min, x.min), scala.math.min(max, x.max))
+  
+  // Not a union, because the result may contain sizes contained by neither term
+  def cover(x: TransferSizes) = {
+    if (none) {
+      x
+    } else if (x.none) {
+      this
+    } else {
+      TransferSizes(scala.math.min(min, x.min), scala.math.max(max, x.max))
+    }
+  }
 
   override def toString() = "TransferSizes[%d, %d]".format(min, max)
- 
 }
 
 object TransferSizes {
   def apply(x: Int) = new TransferSizes(x)
   val none = new TransferSizes(0)
+
+  def cover(seq: Seq[TransferSizes]) = seq.foldLeft(none)(_ cover _)
+  def intersect(seq: Seq[TransferSizes]) = seq.reduce(_ intersect _)
 
   implicit def asBool(x: TransferSizes) = !x.none
 }
@@ -113,7 +129,7 @@ object TransferSizes {
 case class AddressSet(base: BigInt, mask: BigInt) extends Ordered[AddressSet]
 {
   // Forbid misaligned base address (and empty sets)
-  require ((base & mask) == 0, s"Mis-aligned AddressSets are forbidden, got: ($base, $mask)")
+  require ((base & mask) == 0, s"Mis-aligned AddressSets are forbidden, got: ${this.toString}")
   require (base >= 0, s"AddressSet negative base is ambiguous: $base") // TL2 address widths are not fixed => negative is ambiguous
   // We do allow negative mask (=> ignore all high bits)
 
@@ -147,6 +163,17 @@ case class AddressSet(base: BigInt, mask: BigInt) extends Ordered[AddressSet]
       val r_mask = mask & x.mask
       val r_base = base | x.base
       Some(AddressSet(r_base, r_mask))
+    }
+  }
+
+  def subtract(x: AddressSet): Seq[AddressSet] = {
+    if (!overlaps(x)) {
+      Seq(this)
+    } else {
+      val new_inflex = ~x.mask & mask
+      // !!! this fractures too much; find a better algorithm
+      val fracture = AddressSet.enumerateMask(new_inflex).flatMap(m => intersect(AddressSet(m, ~new_inflex)))
+      fracture.filter(!_.overlaps(x))
     }
   }
 
@@ -211,6 +238,24 @@ object AddressSet
     val out = (array zip filter) flatMap { case (a, f) => if (f) None else Some(a) }
     if (out.size != n) unify(out) else out.toList
   }
+
+  def enumerateMask(mask: BigInt): Seq[BigInt] = {
+    def helper(id: BigInt, tail: Seq[BigInt]): Seq[BigInt] =
+      if (id == mask) (id +: tail).reverse else helper(((~mask | id) + 1) & mask, id +: tail)
+    helper(0, Nil)
+  }
+
+  def enumerateBits(mask: BigInt): Seq[BigInt] = {
+    def helper(x: BigInt): Seq[BigInt] = {
+      if (x == 0) {
+        Nil
+      } else {
+        val bit = x & (-x)
+        bit +: helper(x & ~bit)
+      }
+    }
+    helper(mask)
+  }
 }
 
 case class BufferParams(depth: Int, flow: Boolean, pipe: Boolean)
@@ -221,6 +266,10 @@ case class BufferParams(depth: Int, flow: Boolean, pipe: Boolean)
 
   def apply[T <: Data](x: DecoupledIO[T]) =
     if (isDefined) Queue(x, depth, flow=flow, pipe=pipe)
+    else x
+
+  def irrevocable[T <: Data](x: ReadyValidIO[T]) =
+    if (isDefined) Queue.irrevocable(x, depth, flow=flow, pipe=pipe)
     else x
 
   def sq[T <: Data](x: DecoupledIO[T]) =
@@ -270,4 +319,10 @@ case class RationalCrossing(direction: RationalDirection = FastToSlow) extends C
 case class AsynchronousCrossing(depth: Int = 8, sourceSync: Int = 3, sinkSync: Int = 3, safe: Boolean = true, narrow: Boolean = false) extends ClockCrossingType
 {
   def asSinkParams = AsyncQueueParams(depth, sinkSync, safe, narrow)
+}
+
+trait DirectedBuffers[T] {
+  def copyIn(x: BufferParams): T
+  def copyOut(x: BufferParams): T
+  def copyInOut(x: BufferParams): T
 }

@@ -2,34 +2,33 @@
 
 package freechips.rocketchip.subsystem
 
-import Chisel._
-import freechips.rocketchip.config.{Field, Parameters}
+import freechips.rocketchip.config.{Parameters}
+import freechips.rocketchip.devices.tilelink._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
-import freechips.rocketchip.util._
+import freechips.rocketchip.util.{Location}
 
 case class FrontBusParams(
-  beatBytes: Int,
-  blockBytes: Int,
-  sbusCrossing: ClockCrossingType = SynchronousCrossing(),
-  sbusBuffer: BufferParams = BufferParams.none) extends HasTLBusParams
+    beatBytes: Int,
+    blockBytes: Int,
+    dtsFrequency: Option[BigInt] = None,
+    zeroDevice: Option[AddressSet] = None,
+    errorDevice: Option[DevNullParams] = None)
+  extends HasTLBusParams
+  with HasBuiltInDeviceParams
+  with TLBusWrapperInstantiationLike
+{
+  def instantiate(context: HasTileLinkLocations, loc: Location[TLBusWrapper])(implicit p: Parameters): FrontBus = {
+    val fbus = LazyModule(new FrontBus(this, loc.name))
+    fbus.suggestName(loc.name)
+    context.tlBusWrapperLocationMap += (loc -> fbus)
+    fbus
+  }
+}
 
-case object FrontBusKey extends Field[FrontBusParams]
-
-class FrontBus(params: FrontBusParams)(implicit p: Parameters)
-    extends TLBusWrapper(params, "front_bus")
-    with HasClockDomainCrossing
-    with CanAttachTLMasters
+class FrontBus(params: FrontBusParams, name: String = "front_bus")(implicit p: Parameters)
+    extends TLBusWrapper(params, name)
     with HasTLXbarPhy {
-
-  def fromCoherentChip(gen: => TLNode): TLInwardNode = {
-    from("coherent_subsystem") { inwardNode :=* gen }
-  }
-
-  def crossToSystemBus(gen: (=> TLOutwardNode) => NoHandle) {
-    to("sbus") {
-      val tl_xing = this.crossOut(TLBuffer(params.sbusBuffer) :=* outwardNode)
-      gen(tl_xing(params.sbusCrossing))
-    }
-  }
+  val builtInDevices: BuiltInDevices = BuiltInDevices.attach(params, outwardNode)
+  val prefixNode = None
 }

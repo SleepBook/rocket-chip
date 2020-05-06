@@ -6,6 +6,7 @@ import Chisel._
 import chisel3.util.{ReadyValidIO}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.util._
+import scala.collection.immutable.ListMap
 
 abstract class TLBundleBase(params: TLBundleParameters) extends GenericParameterizedBundle(params)
 
@@ -145,7 +146,7 @@ object TLAtomics
   def SWAP = UInt(3, width)
   def isLogical(x: UInt) = x <= SWAP
 
-  def ArithMsg:Seq[String] = Seq("MIN", "MAX", "MIN", "MAXU", "ADD")
+  def ArithMsg:Seq[String] = Seq("MIN", "MAX", "MINU", "MAXU", "ADD")
   def LogicMsg:Seq[String] = Seq("XOR", "OR", "AND", "SWAP")
 }
  
@@ -156,6 +157,7 @@ object TLHints
 
   def PREFETCH_READ  = UInt(0, width)
   def PREFETCH_WRITE = UInt(1, width)
+  def isHints(x: UInt) = x <= PREFETCH_WRITE
 
   def HintsMsg:Seq[String] = Seq("PrefetchRead", "PrefetchWrite")
 }
@@ -177,6 +179,8 @@ final class TLBundleA(params: TLBundleParameters)
   val size    = UInt(width = params.sizeBits)
   val source  = UInt(width = params.sourceBits) // from
   val address = UInt(width = params.addressBits) // to
+  val user    = BundleMap(params.requestFields)
+  val echo    = BundleMap(params.echoFields)
   // variable fields during multibeat:
   val mask    = UInt(width = params.dataBits/8)
   val data    = UInt(width = params.dataBits)
@@ -224,6 +228,8 @@ final class TLBundleD(params: TLBundleParameters)
   val source  = UInt(width = params.sourceBits) // to
   val sink    = UInt(width = params.sinkBits)   // from
   val denied  = Bool() // implies corrupt iff *Data
+  val user    = BundleMap(params.responseFields)
+  val echo    = BundleMap(params.echoFields)
   // variable fields during multibeat:
   val data    = UInt(width = params.dataBits)
   val corrupt = Bool() // only applies to *Data messages
@@ -236,13 +242,26 @@ final class TLBundleE(params: TLBundleParameters)
   val sink = UInt(width = params.sinkBits) // to  
 }
 
-class TLBundle(params: TLBundleParameters) extends TLBundleBase(params)
+class TLBundle(val params: TLBundleParameters) extends Record
 {
-  val a = Decoupled(new TLBundleA(params))
-  val b = Decoupled(new TLBundleB(params)).flip
-  val c = Decoupled(new TLBundleC(params))
-  val d = Decoupled(new TLBundleD(params)).flip
-  val e = Decoupled(new TLBundleE(params))
+  // Emulate a Bundle with elements abcde or ad depending on params.hasBCE
+
+  private val optA = Some                (Decoupled(new TLBundleA(params)))
+  private val optB = params.hasBCE.option(Decoupled(new TLBundleB(params)).flip)
+  private val optC = params.hasBCE.option(Decoupled(new TLBundleC(params)))
+  private val optD = Some                (Decoupled(new TLBundleD(params)).flip)
+  private val optE = params.hasBCE.option(Decoupled(new TLBundleE(params)))
+
+  def a: DecoupledIO[TLBundleA] = optA.getOrElse(Wire(Decoupled(new TLBundleA(params))))
+  def b: DecoupledIO[TLBundleB] = optB.getOrElse(Wire(Decoupled(new TLBundleB(params))))
+  def c: DecoupledIO[TLBundleC] = optC.getOrElse(Wire(Decoupled(new TLBundleC(params))))
+  def d: DecoupledIO[TLBundleD] = optD.getOrElse(Wire(Decoupled(new TLBundleD(params))))
+  def e: DecoupledIO[TLBundleE] = optE.getOrElse(Wire(Decoupled(new TLBundleE(params))))
+
+  override def cloneType: this.type = (new TLBundle(params)).asInstanceOf[this.type]
+  val elements =
+    if (params.hasBCE) ListMap("e" -> e, "d" -> d, "c" -> c, "b" -> b, "a" -> a)
+    else ListMap("d" -> d, "a" -> a)
 
   def tieoff() {
     a.ready.dir match {
@@ -266,49 +285,6 @@ class TLBundle(params: TLBundleParameters) extends TLBundleBase(params)
 object TLBundle
 {
   def apply(params: TLBundleParameters) = new TLBundle(params)
-}
-
-final class DecoupledSnoop[+T <: Data](gen: T) extends Bundle
-{
-  val ready = Bool()
-  val valid = Bool()
-  val bits = gen.asOutput
-
-  def fire() = ready && valid
-  override def cloneType: this.type = new DecoupledSnoop(gen).asInstanceOf[this.type]
-}
-
-object DecoupledSnoop
-{
-  def apply[T <: Data](source: DecoupledIO[T], sink: DecoupledIO[T]) = {
-    val out = Wire(new DecoupledSnoop(sink.bits))
-    out.ready := sink.ready
-    out.valid := source.valid
-    out.bits  := source.bits
-    out
-  }
-}
-
-class TLBundleSnoop(params: TLBundleParameters) extends TLBundleBase(params)
-{
-  val a = new DecoupledSnoop(new TLBundleA(params))
-  val b = new DecoupledSnoop(new TLBundleB(params))
-  val c = new DecoupledSnoop(new TLBundleC(params))
-  val d = new DecoupledSnoop(new TLBundleD(params))
-  val e = new DecoupledSnoop(new TLBundleE(params))
-}
-
-object TLBundleSnoop
-{
-  def apply(source: TLBundle, sink: TLBundle) = {
-    val out = Wire(new TLBundleSnoop(sink.params))
-    out.a := DecoupledSnoop(source.a, sink.a)
-    out.b := DecoupledSnoop(sink.b, source.b)
-    out.c := DecoupledSnoop(source.c, sink.c)
-    out.d := DecoupledSnoop(sink.d, source.d)
-    out.e := DecoupledSnoop(source.e, sink.e)
-    out
-  }
 }
 
 class TLAsyncBundleBase(params: TLAsyncBundleParameters) extends GenericParameterizedBundle(params)

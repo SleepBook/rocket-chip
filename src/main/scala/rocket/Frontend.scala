@@ -5,7 +5,9 @@ package freechips.rocketchip.rocket
 
 import Chisel._
 import Chisel.ImplicitConversions._
-import chisel3.core.withReset
+import chisel3.{withClock,withReset}
+import chisel3.internal.sourceinfo.SourceInfo
+import chisel3.experimental.chiselName
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
 import freechips.rocketchip.diplomacy._
@@ -13,7 +15,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property._
-import chisel3.internal.sourceinfo.SourceInfo
+import freechips.rocketchip.diplomaticobjectmodel.logicaltree.ICacheLogicalTreeNode
 
 class FrontendReq(implicit p: Parameters) extends CoreBundle()(p) {
   val pc = UInt(width = vaddrBitsExtended)
@@ -44,6 +46,8 @@ class FrontendPerfEvents extends Bundle {
 }
 
 class FrontendIO(implicit p: Parameters) extends CoreBundle()(p) {
+  val might_request = Bool(OUTPUT)
+  val clock_enabled = Bool(INPUT)
   val req = Valid(new FrontendReq)
   val sfence = Valid(new SFenceReq)
   val resp = Decoupled(new FrontendResp).flip
@@ -53,7 +57,6 @@ class FrontendIO(implicit p: Parameters) extends CoreBundle()(p) {
   val flush_icache = Bool(OUTPUT)
   val npc = UInt(INPUT, width = vaddrBitsExtended)
   val perf = new FrontendPerfEvents().asInput
-  val customCSRs = new CustomCSRs().asOutput
 }
 
 class Frontend(val icacheParams: ICacheParams, hartid: Int)(implicit p: Parameters) extends LazyModule {
@@ -70,22 +73,41 @@ class FrontendBundle(val outer: Frontend) extends CoreBundle()(outer.p)
   val errors = new ICacheErrors
 }
 
+@chiselName
 class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
-    with HasCoreParameters
+    with HasRocketCoreParameters
     with HasL1ICacheParameters {
   val io = IO(new FrontendBundle(outer))
   implicit val edge = outer.masterNode.edges.out(0)
   val icache = outer.icache.module
   require(fetchWidth*coreInstBytes == outer.icacheParams.fetchBytes)
 
-  val tlb = Module(new TLB(true, log2Ceil(fetchBytes), TLBConfig(nTLBEntries)))
   val fq = withReset(reset || io.cpu.req.valid) { Module(new ShiftQueue(new FrontendResp, 5, flow = true)) }
 
-  val s0_valid = io.cpu.req.valid || !fq.io.mask(fq.io.mask.getWidth-3)
-  val s1_valid = RegNext(s0_valid)
+  val clock_en_reg = Reg(Bool())
+  val clock_en = clock_en_reg || io.cpu.might_request
+  io.cpu.clock_enabled := clock_en
+  assert(!(io.cpu.req.valid || io.cpu.sfence.valid || io.cpu.flush_icache || io.cpu.bht_update.valid || io.cpu.btb_update.valid) || io.cpu.might_request)
+  val gated_clock =
+    if (!rocketParams.clockGate) clock
+    else ClockGate(clock, clock_en, "icache_clock_gate")
+
+  icache.clock := gated_clock
+  icache.io.clock_enabled := clock_en
+  withClock (gated_clock) { // entering gated-clock domain
+
+  val tlb = Module(new TLB(true, log2Ceil(fetchBytes), TLBConfig(nTLBEntries)))
+
+  val s1_valid = Reg(Bool())
+  val s2_valid = RegInit(false.B)
+  val s0_fq_has_space =
+    !fq.io.mask(fq.io.mask.getWidth-3) ||
+    (!fq.io.mask(fq.io.mask.getWidth-2) && (!s1_valid || !s2_valid)) ||
+    (!fq.io.mask(fq.io.mask.getWidth-1) && (!s1_valid && !s2_valid))
+  val s0_valid = io.cpu.req.valid || s0_fq_has_space
+  s1_valid := s0_valid
   val s1_pc = Reg(UInt(width=vaddrBitsExtended))
   val s1_speculative = Reg(Bool())
-  val s2_valid = RegInit(false.B)
   val s2_pc = RegInit(t = UInt(width = vaddrBitsExtended), alignPC(io.reset_vector))
   val s2_btb_resp_valid = if (usingBTB) Reg(Bool()) else false.B
   val s2_btb_resp_bits = Reg(new BTBResp)
@@ -124,7 +146,7 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   }
 
   io.ptw <> tlb.io.ptw
-  tlb.io.req.valid := !s2_replay
+  tlb.io.req.valid := s1_valid && !s2_replay
   tlb.io.req.bits.vaddr := s1_pc
   tlb.io.req.bits.passthrough := Bool(false)
   tlb.io.req.bits.size := log2Ceil(coreInstBytes*fetchWidth)
@@ -138,8 +160,9 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   icache.io.s1_paddr := tlb.io.resp.paddr
   icache.io.s2_vaddr := s2_pc
   icache.io.s1_kill := s2_redirect || tlb.io.resp.miss || s2_replay
-  icache.io.s2_kill := s2_speculative && !s2_tlb_resp.cacheable || s2_xcpt
-  icache.io.s2_prefetch := s2_tlb_resp.prefetchable
+  val s2_can_speculatively_refill = s2_tlb_resp.cacheable && !io.ptw.customCSRs.asInstanceOf[RocketCustomCSRs].disableSpeculativeICacheRefill
+  icache.io.s2_kill := s2_speculative && !s2_can_speculatively_refill || s2_xcpt
+  icache.io.s2_prefetch := s2_tlb_resp.prefetchable && !io.ptw.customCSRs.asInstanceOf[RocketCustomCSRs].disableICachePrefetch
 
   fq.io.enq.valid := RegNext(s1_valid) && s2_valid && (icache.io.resp.valid || !s2_tlb_resp.miss && icache.io.s2_kill)
   fq.io.enq.bits.pc := s2_pc
@@ -151,6 +174,7 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   fq.io.enq.bits.btb := s2_btb_resp_bits
   fq.io.enq.bits.btb.taken := s2_btb_taken
   fq.io.enq.bits.xcpt := s2_tlb_resp
+  assert(!(s2_speculative && io.ptw.customCSRs.asInstanceOf[RocketCustomCSRs].disableSpeculativeICacheRefill && !icache.io.s2_kill))
   when (icache.io.resp.valid && icache.io.resp.bits.ae) { fq.io.enq.bits.xcpt.ae.inst := true }
 
   if (usingBTB) {
@@ -172,8 +196,8 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
       predicted_taken := Bool(true)
     }
 
-    val force_taken = io.cpu.customCSRs.bpmStatic
-    when (io.cpu.customCSRs.flushBTB) { btb.io.flush := true }
+    val force_taken = io.ptw.customCSRs.bpmStatic
+    when (io.ptw.customCSRs.flushBTB) { btb.io.flush := true }
     when (force_taken) { btb.io.bht_update.valid := false }
 
     val s2_base_pc = ~(~s2_pc | (fetchBytes-1))
@@ -307,6 +331,15 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   io.cpu.perf.tlbMiss := io.ptw.req.fire()
   io.errors := icache.io.errors
 
+  // gate the clock
+  clock_en_reg := !rocketParams.clockGate ||
+    io.cpu.might_request || // chicken bit
+    icache.io.keep_clock_enabled || // I$ miss or ITIM access
+    s1_valid || s2_valid || // some fetch in flight
+    !tlb.io.req.ready || // handling TLB miss
+    !fq.io.mask(fq.io.mask.getWidth-1) // queue not full
+  } // leaving gated-clock domain
+
   def alignPC(pc: UInt) = ~(~pc | (coreInstBytes - 1))
 
   def ccover(cond: Bool, label: String, desc: String)(implicit sourceInfo: SourceInfo) =
@@ -320,6 +353,12 @@ trait HasICacheFrontend extends CanHavePTW { this: BaseTile =>
   tlMasterXbar.node := frontend.masterNode
   connectTLSlave(frontend.slaveNode, tileParams.core.fetchBytes)
   nPTWPorts += 1
+
+  // This should be a None in the case of not having an ITIM address, when we
+  // don't actually use the device that is instantiated in the frontend.
+  private val deviceOpt = if (tileParams.icache.get.itimAddr.isDefined) Some(frontend.icache.device) else None
+
+  val iCacheLogicalTreeNode = new ICacheLogicalTreeNode(frontend.icache, deviceOpt, tileParams.icache.get)
 }
 
 trait HasICacheFrontendModule extends CanHavePTWModule {

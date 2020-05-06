@@ -138,7 +138,7 @@ object RegWriteFn
 
 case class RegField(width: Int, read: RegReadFn, write: RegWriteFn, desc: Option[RegFieldDesc])
 {
-  require (width > 0, s"RegField width must be > 0, not $width")
+  require (width >= 0, s"RegField width must be >= 0, not $width")
 
   def pipelined = !read.combinational || !write.combinational
 
@@ -170,6 +170,7 @@ object RegField
   type Map = (Int, Seq[RegField])
 
   def apply(n: Int)                                                             : RegField = apply(n, (), (), Some(RegFieldDesc.reserved))
+  def apply(n: Int, desc: RegFieldDesc)                                         : RegField = apply(n, (), (), Some(desc))
 
   def apply(n: Int, r: RegReadFn, w: RegWriteFn)                                : RegField = apply(n, r,  w,  None)
   def apply(n: Int, r: RegReadFn, w: RegWriteFn, desc: RegFieldDesc)            : RegField = apply(n, r,  w,  Some(desc))

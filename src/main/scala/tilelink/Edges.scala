@@ -7,6 +7,7 @@ import chisel3.internal.sourceinfo.SourceInfo
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.util._
+import scala.reflect.ClassTag
 
 class TLEdge(
   client:  TLClientPortParameters,
@@ -270,6 +271,47 @@ class TLEdge(
   }
   def addr_inc(x: DecoupledIO[TLChannel]): (Bool, Bool, Bool, UInt) = addr_inc(x.bits, x.fire())
   def addr_inc(x: ValidIO[TLChannel]): (Bool, Bool, Bool, UInt) = addr_inc(x.bits, x.valid)
+
+  // This is a very expensive circuit; use only if you really mean it!
+  def inFlight(x: TLBundle): (UInt, UInt) = {
+    val flight = RegInit(UInt(0, width = log2Ceil(3*client.endSourceId+1)))
+    val bce = manager.anySupportAcquireB && client.anySupportProbe
+
+    val (a_first, a_last, _) = firstlast(x.a)
+    val (b_first, b_last, _) = firstlast(x.b)
+    val (c_first, c_last, _) = firstlast(x.c)
+    val (d_first, d_last, _) = firstlast(x.d)
+    val (e_first, e_last, _) = firstlast(x.e)
+
+    val (a_request, a_response) = (isRequest(x.a.bits), isResponse(x.a.bits))
+    val (b_request, b_response) = (isRequest(x.b.bits), isResponse(x.b.bits))
+    val (c_request, c_response) = (isRequest(x.c.bits), isResponse(x.c.bits))
+    val (d_request, d_response) = (isRequest(x.d.bits), isResponse(x.d.bits))
+    val (e_request, e_response) = (isRequest(x.e.bits), isResponse(x.e.bits))
+
+    val a_inc = x.a.fire() && a_first && a_request
+    val b_inc = x.b.fire() && b_first && b_request
+    val c_inc = x.c.fire() && c_first && c_request
+    val d_inc = x.d.fire() && d_first && d_request
+    val e_inc = x.e.fire() && e_first && e_request
+    val inc = Cat(Seq(a_inc, d_inc) ++ (if (bce) Seq(b_inc, c_inc, e_inc) else Nil))
+
+    val a_dec = x.a.fire() && a_last && a_response
+    val b_dec = x.b.fire() && b_last && b_response
+    val c_dec = x.c.fire() && c_last && c_response
+    val d_dec = x.d.fire() && d_last && d_response
+    val e_dec = x.e.fire() && e_last && e_response
+    val dec = Cat(Seq(a_dec, d_dec) ++ (if (bce) Seq(b_dec, c_dec, e_dec) else Nil))
+
+    val next_flight = flight + PopCount(inc) - PopCount(dec)
+    flight := next_flight
+
+    (flight, next_flight)
+  }
+
+  def prettySourceMapping(context: String): String = {
+    s"TL-Source mapping for $context:\n${(new TLSourceIdMap(client)).pretty}\n"
+  }
 }
 
 class TLEdgeOut(
@@ -281,7 +323,7 @@ class TLEdgeOut(
 {
   // Transfers
   def AcquireBlock(fromSource: UInt, toAddress: UInt, lgSize: UInt, growPermissions: UInt) = {
-    require (manager.anySupportAcquireB)
+    require (manager.anySupportAcquireB, s"TileLink: No managers visible from this edge support Acquires, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsAcquireBFast(toAddress, lgSize)
     val a = Wire(new TLBundleA(bundle))
     a.opcode  := TLMessages.AcquireBlock
@@ -296,7 +338,7 @@ class TLEdgeOut(
   }
 
   def AcquirePerm(fromSource: UInt, toAddress: UInt, lgSize: UInt, growPermissions: UInt) = {
-    require (manager.anySupportAcquireB)
+    require (manager.anySupportAcquireB, s"TileLink: No managers visible from this edge support Acquires, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsAcquireBFast(toAddress, lgSize)
     val a = Wire(new TLBundleA(bundle))
     a.opcode  := TLMessages.AcquirePerm
@@ -311,7 +353,7 @@ class TLEdgeOut(
   }
 
   def Release(fromSource: UInt, toAddress: UInt, lgSize: UInt, shrinkPermissions: UInt): (Bool, TLBundleC) = {
-    require (manager.anySupportAcquireB)
+    require (manager.anySupportAcquireB, s"TileLink: No managers visible from this edge support Acquires, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsAcquireBFast(toAddress, lgSize)
     val c = Wire(new TLBundleC(bundle))
     c.opcode  := TLMessages.Release
@@ -325,7 +367,7 @@ class TLEdgeOut(
   }
 
   def Release(fromSource: UInt, toAddress: UInt, lgSize: UInt, shrinkPermissions: UInt, data: UInt, corrupt: Bool): (Bool, TLBundleC) = {
-    require (manager.anySupportAcquireB)
+    require (manager.anySupportAcquireB, s"TileLink: No managers visible from this edge support Acquires, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsAcquireBFast(toAddress, lgSize)
     val c = Wire(new TLBundleC(bundle))
     c.opcode  := TLMessages.ReleaseData
@@ -383,7 +425,7 @@ class TLEdgeOut(
 
   // Accesses
   def Get(fromSource: UInt, toAddress: UInt, lgSize: UInt) = {
-    require (manager.anySupportGet)
+    require (manager.anySupportGet, s"TileLink: No managers visible from this edge support Gets, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsGetFast(toAddress, lgSize)
     val a = Wire(new TLBundleA(bundle))
     a.opcode  := TLMessages.Get
@@ -401,7 +443,7 @@ class TLEdgeOut(
     Put(fromSource, toAddress, lgSize, data, Bool(false))
 
   def Put(fromSource: UInt, toAddress: UInt, lgSize: UInt, data: UInt, corrupt: Bool): (Bool, TLBundleA) = {
-    require (manager.anySupportPutFull)
+    require (manager.anySupportPutFull, s"TileLink: No managers visible from this edge support Puts, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsPutFullFast(toAddress, lgSize)
     val a = Wire(new TLBundleA(bundle))
     a.opcode  := TLMessages.PutFullData
@@ -419,7 +461,7 @@ class TLEdgeOut(
     Put(fromSource, toAddress, lgSize, data, mask, Bool(false))
 
   def Put(fromSource: UInt, toAddress: UInt, lgSize: UInt, data: UInt, mask: UInt, corrupt: Bool): (Bool, TLBundleA) = {
-    require (manager.anySupportPutPartial)
+    require (manager.anySupportPutPartial, s"TileLink: No managers visible from this edge support masked Puts, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsPutPartialFast(toAddress, lgSize)
     val a = Wire(new TLBundleA(bundle))
     a.opcode  := TLMessages.PutPartialData
@@ -434,7 +476,7 @@ class TLEdgeOut(
   }
 
   def Arithmetic(fromSource: UInt, toAddress: UInt, lgSize: UInt, data: UInt, atomic: UInt, corrupt: Bool = Bool(false)): (Bool, TLBundleA) = {
-    require (manager.anySupportArithmetic)
+    require (manager.anySupportArithmetic, s"TileLink: No managers visible from this edge support arithmetic AMOs, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsArithmeticFast(toAddress, lgSize)
     val a = Wire(new TLBundleA(bundle))
     a.opcode  := TLMessages.ArithmeticData
@@ -449,7 +491,7 @@ class TLEdgeOut(
   }
 
   def Logical(fromSource: UInt, toAddress: UInt, lgSize: UInt, data: UInt, atomic: UInt, corrupt: Bool = Bool(false)) = {
-    require (manager.anySupportLogical)
+    require (manager.anySupportLogical, s"TileLink: No managers visible from this edge support logical AMOs, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsLogicalFast(toAddress, lgSize)
     val a = Wire(new TLBundleA(bundle))
     a.opcode  := TLMessages.LogicalData
@@ -464,7 +506,7 @@ class TLEdgeOut(
   }
 
   def Hint(fromSource: UInt, toAddress: UInt, lgSize: UInt, param: UInt) = {
-    require (manager.anySupportHint)
+    require (manager.anySupportHint, s"TileLink: No managers visible from this edge support Hints, but one of these clients would try to request one: ${client.clients}")
     val legal = manager.supportsHintFast(toAddress, lgSize)
     val a = Wire(new TLBundleA(bundle))
     a.opcode  := TLMessages.Hint
@@ -527,9 +569,16 @@ class TLEdgeIn(
   sourceInfo: SourceInfo)
   extends TLEdge(client, manager, params, sourceInfo)
 {
+  private def myTranspose[T](x: Seq[Seq[T]]): Seq[Seq[T]] = {
+    val todo = x.filter(!_.isEmpty)
+    val heads = todo.map(_.head)
+    val tails = todo.map(_.tail)
+    if (todo.isEmpty) Nil else { heads +: myTranspose(tails) }
+  }
+
   // Transfers
   def Probe(fromAddress: UInt, toSource: UInt, lgSize: UInt, capPermissions: UInt) = {
-    require (client.anySupportProbe)
+    require (client.anySupportProbe, s"TileLink: No clients visible from this edge support probes, but one of these managers tried to issue one: ${manager.managers}")
     val legal = client.supportsProbe(toSource, lgSize)
     val b = Wire(new TLBundleB(bundle))
     b.opcode  := TLMessages.Probe
@@ -587,7 +636,7 @@ class TLEdgeIn(
 
   // Accesses
   def Get(fromAddress: UInt, toSource: UInt, lgSize: UInt) = {
-    require (client.anySupportGet)
+    require (client.anySupportGet, s"TileLink: No clients visible from this edge support Gets, but one of these managers would try to issue one: ${manager.managers}")
     val legal = client.supportsGet(toSource, lgSize)
     val b = Wire(new TLBundleB(bundle))
     b.opcode  := TLMessages.Get
@@ -605,7 +654,7 @@ class TLEdgeIn(
     Put(fromAddress, toSource, lgSize, data, Bool(false))
 
   def Put(fromAddress: UInt, toSource: UInt, lgSize: UInt, data: UInt, corrupt: Bool): (Bool, TLBundleB) = {
-    require (client.anySupportPutFull)
+    require (client.anySupportPutFull, s"TileLink: No clients visible from this edge support Puts, but one of these managers would try to issue one: ${manager.managers}")
     val legal = client.supportsPutFull(toSource, lgSize)
     val b = Wire(new TLBundleB(bundle))
     b.opcode  := TLMessages.PutFullData
@@ -623,7 +672,7 @@ class TLEdgeIn(
     Put(fromAddress, toSource, lgSize, data, mask, Bool(false))
 
   def Put(fromAddress: UInt, toSource: UInt, lgSize: UInt, data: UInt, mask: UInt, corrupt: Bool): (Bool, TLBundleB) = {
-    require (client.anySupportPutPartial)
+    require (client.anySupportPutPartial, s"TileLink: No clients visible from this edge support masked Puts, but one of these managers would try to request one: ${manager.managers}")
     val legal = client.supportsPutPartial(toSource, lgSize)
     val b = Wire(new TLBundleB(bundle))
     b.opcode  := TLMessages.PutPartialData
@@ -638,7 +687,7 @@ class TLEdgeIn(
   }
 
   def Arithmetic(fromAddress: UInt, toSource: UInt, lgSize: UInt, data: UInt, atomic: UInt, corrupt: Bool = Bool(false)) = {
-    require (client.anySupportArithmetic)
+    require (client.anySupportArithmetic, s"TileLink: No clients visible from this edge support arithmetic AMOs, but one of these managers would try to request one: ${manager.managers}")
     val legal = client.supportsArithmetic(toSource, lgSize)
     val b = Wire(new TLBundleB(bundle))
     b.opcode  := TLMessages.ArithmeticData
@@ -653,7 +702,7 @@ class TLEdgeIn(
   }
 
   def Logical(fromAddress: UInt, toSource: UInt, lgSize: UInt, data: UInt, atomic: UInt, corrupt: Bool = Bool(false)) = {
-    require (client.anySupportLogical)
+    require (client.anySupportLogical, s"TileLink: No clients visible from this edge support logical AMOs, but one of these managers would try to request one: ${manager.managers}")
     val legal = client.supportsLogical(toSource, lgSize)
     val b = Wire(new TLBundleB(bundle))
     b.opcode  := TLMessages.LogicalData
@@ -668,7 +717,7 @@ class TLEdgeIn(
   }
 
   def Hint(fromAddress: UInt, toSource: UInt, lgSize: UInt, param: UInt) = {
-    require (client.anySupportHint)
+    require (client.anySupportHint, s"TileLink: No clients visible from this edge support Hints, but one of these managers would try to request one: ${manager.managers}")
     val legal = client.supportsHint(toSource, lgSize)
     val b = Wire(new TLBundleB(bundle))
     b.opcode  := TLMessages.Hint

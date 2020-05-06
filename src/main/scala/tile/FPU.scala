@@ -3,17 +3,20 @@
 
 package freechips.rocketchip.tile
 
-import Chisel._
+import Chisel.{defaultCompileOptions => _, _}
+import freechips.rocketchip.util.CompileOptions.NotStrictInferReset
 import Chisel.ImplicitConversions._
-
+import chisel3.withClock
+import chisel3.internal.sourceinfo.SourceInfo
+import chisel3.experimental.{chiselName, NoChiselNamePrefix}
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property._
-import chisel3.internal.sourceinfo.SourceInfo
 
 case class FPUParams(
+  minFLen: Int = 32,
   fLen: Int = 64,
   divSqrt: Boolean = true,
   sfmaLatency: Int = 3,
@@ -157,6 +160,8 @@ class FPUCoreIO(implicit p: Parameters) extends CoreBundle()(p) {
   val sboard_set = Bool(OUTPUT)
   val sboard_clr = Bool(OUTPUT)
   val sboard_clra = UInt(OUTPUT, 5)
+
+  val keep_clock_enabled = Bool(INPUT)
 }
 
 class FPUIO(implicit p: Parameters) extends FPUCoreIO ()(p) {
@@ -190,7 +195,8 @@ case class FType(exp: Int, sig: Int) {
   def ieeeWidth = exp + sig
   def recodedWidth = ieeeWidth + 1
 
-  def qNaN = UInt((BigInt(7) << (exp + sig - 3)) + (BigInt(1) << (sig - 2)), exp + sig + 1)
+  def ieeeQNaN = UInt((BigInt(1) << (ieeeWidth - 1)) - (BigInt(1) << (sig - 2)), ieeeWidth)
+  def qNaN = UInt((BigInt(7) << (exp + sig - 3)) + (BigInt(1) << (sig - 2)), recodedWidth)
   def isNaN(x: UInt) = x(sig + exp - 1, sig + exp - 3).andR
   def isSNaN(x: UInt) = isNaN(x) && !x(sig - 2)
 
@@ -228,29 +234,44 @@ case class FType(exp: Int, sig: Int) {
     Cat(sign, expOut, fractOut)
   }
 
+  private def ieeeBundle = {
+    val expWidth = exp
+    class IEEEBundle extends Bundle {
+      val sign = Bool()
+      val exp = UInt(expWidth.W)
+      val sig = UInt((ieeeWidth-expWidth-1).W)
+      override def cloneType = new IEEEBundle().asInstanceOf[this.type]
+    }
+    new IEEEBundle
+  }
+
+  def unpackIEEE(x: UInt) = x.asTypeOf(ieeeBundle)
+
   def recode(x: UInt) = hardfloat.recFNFromFN(exp, sig, x)
   def ieee(x: UInt) = hardfloat.fNFromRecFN(exp, sig, x)
 }
 
 object FType {
+  val H = new FType(5, 11)
   val S = new FType(8, 24)
   val D = new FType(11, 53)
 
-  val all = List(S, D)
+  val all = List(H, S, D)
 }
 
 trait HasFPUParameters {
-  require(fLen == 32 || fLen == 64)
+  require(fLen == 0 || FType.all.exists(_.ieeeWidth == fLen))
+  val minFLen: Int
   val fLen: Int
   def xLen: Int
   val minXLen = 32
   val nIntTypes = log2Ceil(xLen/minXLen) + 1
-  val floatTypes = FType.all.filter(_.ieeeWidth <= fLen)
-  val minType = floatTypes.head
-  val maxType = floatTypes.last
+  val floatTypes = FType.all.filter(t => minFLen <= t.ieeeWidth && t.ieeeWidth <= fLen)
+  def minType = floatTypes.head
+  def maxType = floatTypes.last
   def prevType(t: FType) = floatTypes(typeTag(t) - 1)
-  val maxExpWidth = maxType.exp
-  val maxSigWidth = maxType.sig
+  def maxExpWidth = maxType.exp
+  def maxSigWidth = maxType.sig
   def typeTag(t: FType) = floatTypes.indexOf(t)
 
   private def isBox(x: UInt, t: FType): Bool = x(t.sig + t.exp, t.sig + t.exp - 4).andR
@@ -372,7 +393,7 @@ trait HasFPUParameters {
   }
 }
 
-abstract class FPUModule(implicit p: Parameters) extends CoreModule()(p) with HasFPUParameters
+abstract class FPUModule(implicit val p: Parameters) extends Module with HasCoreParameters with HasFPUParameters
 
 class FPToInt(implicit p: Parameters) extends FPUModule()(p) with ShouldBeRetimed {
   class Output extends Bundle {
@@ -418,7 +439,6 @@ class FPToInt(implicit p: Parameters) extends FPUModule()(p) with ShouldBeRetime
     when (!in.ren2) { // fcvt
       val cvtType = in.typ.extract(log2Ceil(nIntTypes), 1)
       intType := cvtType
-
       val conv = Module(new hardfloat.RecFNToIN(maxExpWidth, maxSigWidth, xLen))
       conv.io.in := in.in1
       conv.io.roundingMode := in.rm
@@ -573,10 +593,9 @@ class MulAddRecFNPipe(latency: Int, expWidth: Int, sigWidth: Int) extends Module
 
     //------------------------------------------------------------------------
     //------------------------------------------------------------------------
-    val mulAddRecFNToRaw_preMul =
-        Module(new hardfloat.MulAddRecFNToRaw_preMul(expWidth, sigWidth))
-    val mulAddRecFNToRaw_postMul =
-        Module(new hardfloat.MulAddRecFNToRaw_postMul(expWidth, sigWidth))
+
+    val mulAddRecFNToRaw_preMul = Module(new hardfloat.MulAddRecFNToRaw_preMul(expWidth, sigWidth))
+    val mulAddRecFNToRaw_postMul = Module(new hardfloat.MulAddRecFNToRaw_postMul(expWidth, sigWidth))
 
     mulAddRecFNToRaw_preMul.io.op := io.op
     mulAddRecFNToRaw_preMul.io.a  := io.a
@@ -602,6 +621,7 @@ class MulAddRecFNPipe(latency: Int, expWidth: Int, sigWidth: Int) extends Module
     
     //------------------------------------------------------------------------
     //------------------------------------------------------------------------
+
     val roundRawFNToRecFN = Module(new hardfloat.RoundRawFNToRecFN(expWidth, sigWidth, 0))
 
     val round_regs = if(latency==2) 1 else 0
@@ -654,12 +674,38 @@ class FPUFMAPipe(val latency: Int, val t: FType)
   io.out := Pipe(fma.io.validout, res, (latency-3) max 0)
 }
 
+@chiselName
 class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
   val io = new FPUIO
 
+  val useClockGating = coreParams match {
+    case r: RocketCoreParams => r.clockGate
+    case _ => false
+  }
+  val clock_en_reg = Reg(Bool())
+  val clock_en = clock_en_reg || io.cp_req.valid
+  val gated_clock =
+    if (!useClockGating) clock
+    else ClockGate(clock, clock_en, "fpu_clock_gate")
+
+  val fp_decoder = Module(new FPUDecoder)
+  fp_decoder.io.inst := io.inst
+  val id_ctrl = fp_decoder.io.sigs
+
   val ex_reg_valid = Reg(next=io.valid, init=Bool(false))
-  val req_valid = ex_reg_valid || io.cp_req.valid
   val ex_reg_inst = RegEnable(io.inst, io.valid)
+  val ex_reg_ctrl = RegEnable(id_ctrl, io.valid)
+  val ex_ra = List.fill(3)(Reg(UInt()))
+
+  // load response
+  val load_wb = Reg(next=io.dmem_resp_val)
+  val load_wb_double = RegEnable(io.dmem_resp_type(0), io.dmem_resp_val)
+  val load_wb_data = RegEnable(io.dmem_resp_data, io.dmem_resp_val)
+  val load_wb_tag = RegEnable(io.dmem_resp_tag, io.dmem_resp_val)
+
+  @chiselName class FPUImpl extends NoChiselNamePrefix { // entering gated-clock domain
+
+  val req_valid = ex_reg_valid || io.cp_req.valid
   val ex_cp_valid = io.cp_req.fire()
   val mem_cp_valid = Reg(next=ex_cp_valid, init=Bool(false))
   val wb_cp_valid = Reg(next=mem_cp_valid, init=Bool(false))
@@ -673,24 +719,14 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
   val mem_reg_inst = RegEnable(ex_reg_inst, ex_reg_valid)
   val wb_reg_valid = Reg(next=mem_reg_valid && (!killm || mem_cp_valid), init=Bool(false))
 
-  val fp_decoder = Module(new FPUDecoder)
-  fp_decoder.io.inst := io.inst
-
   val cp_ctrl = Wire(new FPUCtrlSigs)
   cp_ctrl <> io.cp_req.bits
   io.cp_resp.valid := Bool(false)
   io.cp_resp.bits.data := UInt(0)
 
-  val id_ctrl = fp_decoder.io.sigs
-  val ex_ctrl = Mux(ex_cp_valid, cp_ctrl, RegEnable(id_ctrl, io.valid))
+  val ex_ctrl = Mux(ex_cp_valid, cp_ctrl, ex_reg_ctrl)
   val mem_ctrl = RegEnable(ex_ctrl, req_valid)
   val wb_ctrl = RegEnable(mem_ctrl, mem_reg_valid)
-
-  // load response
-  val load_wb = Reg(next=io.dmem_resp_val)
-  val load_wb_double = RegEnable(io.dmem_resp_type(0), io.dmem_resp_val)
-  val load_wb_data = RegEnable(io.dmem_resp_data, io.dmem_resp_val)
-  val load_wb_tag = RegEnable(io.dmem_resp_tag, io.dmem_resp_val)
 
   // regfile
   val regfile = Mem(32, Bits(width = fLen+1))
@@ -702,7 +738,6 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
       printf("f%d p%d 0x%x\n", load_wb_tag, load_wb_tag + 32, load_wb_data)
   }
 
-  val ex_ra = List.fill(3)(Reg(UInt()))
   val ex_rs = ex_ra.map(a => regfile(a))
   when (io.valid) {
     when (id_ctrl.ren1) {
@@ -717,6 +752,26 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
     when (id_ctrl.ren3) { ex_ra(2) := io.inst(31,27) }
   }
   val ex_rm = Mux(ex_reg_inst(14,12) === Bits(7), io.fcsr_rm, ex_reg_inst(14,12))
+
+  def fuInput(minT: Option[FType]): FPInput = {
+    val req = Wire(new FPInput)
+    val tag = !ex_ctrl.singleIn // TODO typeTag
+    req := ex_ctrl
+    req.rm := ex_rm
+    req.in1 := unbox(ex_rs(0), tag, minT)
+    req.in2 := unbox(ex_rs(1), tag, minT)
+    req.in3 := unbox(ex_rs(2), tag, minT)
+    req.typ := ex_reg_inst(21,20)
+    req.fmaCmd := ex_reg_inst(3,2) | (!ex_ctrl.ren3 && ex_reg_inst(27))
+    when (ex_cp_valid) {
+      req := io.cp_req.bits
+      when (io.cp_req.bits.swap23) {
+        req.in2 := io.cp_req.bits.in3
+        req.in3 := io.cp_req.bits.in2
+      }
+    }
+    req
+  }
 
   val sfma = Module(new FPUFMAPipe(cfg.sfmaLatency, FType.S))
   sfma.io.in.valid := req_valid && ex_ctrl.fma && ex_ctrl.singleOut
@@ -872,25 +927,18 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
     when (id_ctrl.div || id_ctrl.sqrt) { io.illegal_rm := true }
   }
 
-  def fuInput(minT: Option[FType]): FPInput = {
-    val req = Wire(new FPInput)
-    val tag = !ex_ctrl.singleIn // TODO typeTag
-    req := ex_ctrl
-    req.rm := ex_rm
-    req.in1 := unbox(ex_rs(0), tag, minT)
-    req.in2 := unbox(ex_rs(1), tag, minT)
-    req.in3 := unbox(ex_rs(2), tag, minT)
-    req.typ := ex_reg_inst(21,20)
-    req.fmaCmd := ex_reg_inst(3,2) | (!ex_ctrl.ren3 && ex_reg_inst(27))
-    when (ex_cp_valid) {
-      req := io.cp_req.bits
-      when (io.cp_req.bits.swap23) {
-        req.in2 := io.cp_req.bits.in3
-        req.in3 := io.cp_req.bits.in2
-      }
-    }
-    req
-  }
+  // gate the clock
+  clock_en_reg := !useClockGating ||
+    io.keep_clock_enabled || // chicken bit
+    io.valid || // ID stage
+    req_valid || // EX stage
+    mem_reg_valid || mem_cp_valid || // MEM stage
+    wb_reg_valid || wb_cp_valid || // WB stage
+    wen.orR || divSqrt_inFlight || // post-WB stage
+    io.dmem_resp_val // load writeback
+
+  } // leaving gated-clock domain
+  val fpuImpl = withClock (gated_clock) { new FPUImpl }
 
   def ccover(cond: Bool, label: String, desc: String)(implicit sourceInfo: SourceInfo) =
     cover(cond, s"FPU_$label", "Core;;" + desc)

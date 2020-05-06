@@ -14,12 +14,12 @@ class TileInterrupts(implicit p: Parameters) extends CoreBundle()(p) {
   val mtip = Bool()
   val msip = Bool()
   val meip = Bool()
-  val seip = usingVM.option(Bool())
+  val seip = usingSupervisor.option(Bool())
   val lip = Vec(coreParams.nLocalInterrupts, Bool())
 }
 
 // Use diplomatic interrupts to external interrupts from the subsystem into the tile
-trait HasExternalInterrupts { this: BaseTile =>
+trait SinksExternalInterrupts { this: BaseTile =>
 
   val intInwardNode = intXbar.intnode :=* IntIdentityNode()(ValName("int_local"))
   protected val intSinkNode = IntSinkNode(IntSinkPortSimple())
@@ -55,7 +55,7 @@ trait HasExternalInterrupts { this: BaseTile =>
   // debug, msip, mtip, meip, seip, lip offsets in CSRs
   def csrIntMap: List[Int] = {
     val nlips = tileParams.core.nLocalInterrupts
-    val seip = if (usingVM) Seq(9) else Nil
+    val seip = if (usingSupervisor) Seq(9) else Nil
     List(65535, 3, 7, 11) ++ seip ++ List.tabulate(nlips)(_ + 16)
   }
 
@@ -73,5 +73,49 @@ trait HasExternalInterrupts { this: BaseTile =>
 
     val (interrupts, _) = intSinkNode.in(0)
     (async_ips ++ periph_ips ++ seip ++ core_ips).zip(interrupts).foreach { case(c, i) => c := i }
+  }
+}
+
+trait SourcesExternalNotifications { this: BaseTile =>
+  // Report unrecoverable error conditions
+  val haltNode = IntSourceNode(IntSourcePortSimple())
+
+  def reportHalt(could_halt: Option[Bool]) {
+    val (halt_and_catch_fire, _) = haltNode.out(0)
+    halt_and_catch_fire(0) := could_halt.map(RegEnable(true.B, false.B, _)).getOrElse(false.B)
+  }
+
+  def reportHalt(errors: Seq[CanHaveErrors]) {
+    reportHalt(errors.flatMap(_.uncorrectable).map(_.valid).reduceOption(_||_))
+  }
+
+  // Report when the tile has ceased to retire instructions
+  val ceaseNode = IntSourceNode(IntSourcePortSimple())
+
+  def reportCease(could_cease: Option[Bool], quiescenceCycles: Int = 8) {
+    def waitForQuiescence(cease: Bool): Bool = {
+      // don't report cease until signal is stable for longer than any pipeline depth
+      val count = RegInit(0.U(log2Ceil(quiescenceCycles + 1).W))
+      val saturated = count >= quiescenceCycles.U
+      when (!cease) { count := 0.U }
+      when (cease && !saturated) { count := count + 1.U }
+      saturated
+    }
+    val (cease, _) = ceaseNode.out(0)
+    cease(0) := could_cease.map{ c => 
+      val cease = (waitForQuiescence(c))
+      // Test-Only Code --
+      val prev_cease = RegNext(c, false.B)
+      assert(!(prev_cease & !c), "CEASE line can not glitch once raised") 
+      cease
+    }.getOrElse(false.B)
+  }
+
+  // Report when the tile is waiting for an interrupt
+  val wfiNode = IntSourceNode(IntSourcePortSimple())
+
+  def reportWFI(could_wfi: Option[Bool]) {
+    val (wfi, _) = wfiNode.out(0)
+    wfi(0) := could_wfi.map(RegNext(_, init=false.B)).getOrElse(false.B)
   }
 }

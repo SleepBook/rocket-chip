@@ -8,24 +8,27 @@ import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.devices.tilelink._
 import freechips.rocketchip.devices.debug.{HasPeripheryDebug, HasPeripheryDebugModuleImp}
 import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.diplomaticobjectmodel.logicaltree._
+import freechips.rocketchip.diplomaticobjectmodel.model._
 import freechips.rocketchip.tile._
-import freechips.rocketchip.tilelink._
-import freechips.rocketchip.interrupts._
-import freechips.rocketchip.util._
+
+case object HartPrefixKey extends Field[Boolean](false)
 
 // TODO: how specific are these to RocketTiles?
-case class TileMasterPortParams(buffers: Int = 0, cork: Option[Boolean] = None)
-case class TileSlavePortParams(buffers: Int = 0, blockerCtrlAddr: Option[BigInt] = None)
+case class TileMasterPortParams(
+  buffers: Int = 0,
+  cork: Option[Boolean] = None,
+  where: TLBusWrapperLocation = SBUS)
+
+case class TileSlavePortParams(
+  buffers: Int = 0,
+  blockerCtrlAddr: Option[BigInt] = None,
+  where: TLBusWrapperLocation = CBUS)
 
 case class RocketCrossingParams(
-    crossingType: ClockCrossingType = SynchronousCrossing(),
-    master: TileMasterPortParams = TileMasterPortParams(),
-    slave: TileSlavePortParams = TileSlavePortParams()) {
-  def knownRatio: Option[Int] = crossingType match {
-    case RationalCrossing(_) => Some(2)
-    case _ => None
-  }
-}
+  crossingType: ClockCrossingType = SynchronousCrossing(),
+  master: TileMasterPortParams = TileMasterPortParams(),
+  slave: TileSlavePortParams = TileSlavePortParams())
 
 case object RocketTilesKey extends Field[Seq[RocketTileParams]](Nil)
 case object RocketCrossingKey extends Field[Seq[RocketCrossingParams]](List(RocketCrossingParams()))
@@ -44,15 +47,24 @@ trait HasRocketTiles extends HasTiles
   // Note that we also inject new nodes into the tile itself,
   // also based on the crossing type.
   val rocketTiles = rocketTileParams.zip(crossings).map { case (tp, crossing) =>
-    val rocket = LazyModule(new RocketTile(tp, crossing.crossingType)(augmentedTileParameters(tp)))
-      .suggestName(tp.name)
+    val rocket = LazyModule(new RocketTile(tp, crossing, PriorityMuxHartIdFromSeq(rocketTileParams), logicalTreeNode))
 
     connectMasterPortsToSBus(rocket, crossing)
     connectSlavePortsToCBus(rocket, crossing)
-    connectInterrupts(rocket, Some(debug), clintOpt, plicOpt)
+    connectInterrupts(rocket, debugOpt, clintOpt, plicOpt)
 
     rocket
   }
+
+  rocketTiles.map {
+    r =>
+      def treeNode: RocketTileLogicalTreeNode = new RocketTileLogicalTreeNode(r.rocketLogicalTree.getOMInterruptTargets)
+      LogicalModuleTree.add(logicalTreeNode, r.rocketLogicalTree)
+  }
+
+  def coreMonitorBundles = (rocketTiles map { t =>
+    t.module.core.rocketImpl.coreMonitorBundle
+  }).toList
 }
 
 trait HasRocketTilesModuleImp extends HasTilesModuleImp
@@ -60,18 +72,39 @@ trait HasRocketTilesModuleImp extends HasTilesModuleImp
   val outer: HasRocketTiles
 }
 
+// Field for specifying MaskROM addition to subsystem
+case object PeripheryMaskROMKey extends Field[Seq[MaskROMParams]](Nil)
+
 class RocketSubsystem(implicit p: Parameters) extends BaseSubsystem
     with HasRocketTiles {
   val tiles = rocketTiles
+        
+  // add Mask ROM devices
+  val maskROMs = p(PeripheryMaskROMKey).map { MaskROM.attach(_, cbus) }
+
+  val hartPrefixNode = if (p(HartPrefixKey)) {
+    Some(BundleBroadcast[UInt](registered = true))
+  } else {
+    None
+  }
+
+  val hartPrefixes = hartPrefixNode.map { hpn => Seq.fill(tiles.size) {
+   val hps = BundleBridgeSink[UInt]
+   hps := hpn
+   hps
+  } }.getOrElse(Nil)
+
   override lazy val module = new RocketSubsystemModuleImp(this)
 }
 
 class RocketSubsystemModuleImp[+L <: RocketSubsystem](_outer: L) extends BaseSubsystemModuleImp(_outer)
+    with HasResetVectorWire
     with HasRocketTilesModuleImp {
-  tile_inputs.zip(outer.hartIdList).foreach { case(wire, i) =>
-    wire.clock := clock
-    wire.reset := reset
-    wire.hartid := UInt(i)
+
+  for (i <- 0 until outer.tiles.size) {
+    val wire = tile_inputs(i)
+    val prefix = outer.hartPrefixes.lift(i).map(_.bundle).getOrElse(UInt(0))
+    wire.hartid := prefix | UInt(outer.hartIdList(i))
     wire.reset_vector := global_reset_vector
   }
 }

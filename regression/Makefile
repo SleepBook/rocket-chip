@@ -17,9 +17,12 @@ TORTURE_CONFIG ?= default
 # The top-level directory that contains rocket-chip
 TOP ?= ..
 
+# The directory that tools get checked out into
+RISCV_TOOLS = $(abspath $(TOP))/rocket-tools
+
 # The hash of the tools that we're using
-TOOLS_HASH ?= $(shell git -C $(TOP) ls-tree HEAD -- riscv-tools | xargs echo | cut -d' ' -f3)
-$(info Using riscv-tools of $(TOOLS_HASH))
+TOOLS_HASH ?= $(shell cat $(TOP)/riscv-tools.hash)
+$(info Using rocket-tools of $(TOOLS_HASH))
 
 # The directory that the tools get built into.
 RISCV ?= install/$(TOOLS_HASH)
@@ -43,22 +46,22 @@ endif
 
 ifeq ($(SUITE),RocketSuiteA)
 PROJECT=freechips.rocketchip.system
-CONFIGS=DefaultConfig
+CONFIGS=$(PROJECT).DefaultConfig
 endif
 
 ifeq ($(SUITE),RocketSuiteB)
 PROJECT=freechips.rocketchip.system
-CONFIGS=DefaultBufferlessConfig
+CONFIGS=$(PROJECT).DefaultBufferlessConfig
 endif
 
 ifeq ($(SUITE),RocketSuiteC)
 PROJECT=freechips.rocketchip.system
-CONFIGS=TinyConfig
+CONFIGS=$(PROJECT).TinyConfig
 endif
 
 ifeq ($(SUITE),UnittestSuite)
 PROJECT=freechips.rocketchip.unittest
-CONFIGS=AMBAUnitTestConfig TLSimpleUnitTestConfig TLWidthUnitTestConfig
+CONFIGS=$(PROJECT).AMBAUnitTestConfig $(PROJECT).TLSimpleUnitTestConfig $(PROJECT).TLWidthUnitTestConfig
 endif
 
 ifeq ($(SUITE), JtagDtmSuite)
@@ -66,22 +69,38 @@ PROJECT=freechips.rocketchip.system
 
 export JTAG_DTM_ENABLE_SBA ?= off
 ifeq ($(JTAG_DTM_ENABLE_SBA), off)
-CONFIGS_32=WithJtagDTMSystem_DefaultRV32Config
-CONFIGS_64=WithJtagDTMSystem_DefaultConfig
+CONFIGS_32=$(PROJECT).WithJtagDTMSystem,$(PROJECT).DefaultRV32Config
+CONFIGS_64=$(PROJECT).WithJtagDTMSystem,$(PROJECT).DefaultConfig
 endif
 
 ifeq ($(JTAG_DTM_ENABLE_SBA), on)
-CONFIGS_32=WithJtagDTMSystem_WithDebugSBASystem_DefaultRV32Config
-CONFIGS_64=WithJtagDTMSystem_WithDebugSBASystem_DefaultConfig
+CONFIGS_32=$(PROJECT).WithJtagDTMSystem,$(PROJECT).WithDebugSBASystem,$(PROJECT).DefaultRV32Config
+CONFIGS_64=$(PROJECT).WithJtagDTMSystem,$(PROJECT).WithDebugSBASystem,$(PROJECT).DefaultConfig
 endif
 
 CONFIGS += $(CONFIGS_32)
 CONFIGS += $(CONFIGS_64)
 endif
 
+# Miscellaneous configs cover any remaining configurations not tested
+# above, but are included in the freechips.rocketchip.system package.
+# These are here to prevent regressions at the compilation level and
+# expected to be built, but not executed.
 ifeq ($(SUITE), Miscellaneous)
 PROJECT=freechips.rocketchip.system
-CONFIGS=RoccExampleConfig
+CONFIGS=\
+	$(PROJECT).DefaultSmallConfig \
+	$(PROJECT).DualBankConfig \
+	$(PROJECT).DualChannelConfig \
+	$(PROJECT).DualChannelDualBankConfig \
+	$(PROJECT).RoccExampleConfig \
+	$(PROJECT).Edge128BitConfig \
+	$(PROJECT).Edge32BitConfig \
+	$(PROJECT).QuadChannelBenchmarkConfig \
+	$(PROJECT).EightChannelConfig \
+	$(PROJECT).DualCoreConfig \
+	$(PROJECT).MemPortOnlyConfig \
+	$(PROJECT).MMIOPortOnlyConfig
 endif
 
 # These are the named regression targets.  While it's expected you run them in
@@ -123,7 +142,7 @@ vsim-bmark-tests: $(VSIM_BMARK_TEST_STAMPS)
 vsim-regression-tests: $(VSIM_REGRESSION_TEST_STAMPS)
 vsim-torture: $(VSIM_TORTURE_STAMPS)
 
-submodule_names = chisel3 firrtl torture hardfloat $(ROCKETCHIP_ADDONS)
+submodule_names = chisel3 firrtl torture hardfloat api-config-chipsalliance $(ROCKETCHIP_ADDONS)
 
 # Checks out all the rocket-chip submodules
 stamps/other-submodules.stamp:
@@ -131,18 +150,26 @@ stamps/other-submodules.stamp:
 	git -C $(abspath $(TOP)) submodule update --init --recursive $(submodule_names)
 	date > $@
 
-$(RISCV)/install.stamp:
+stamps/rocket-tools_checkout.stamp:
 	mkdir -p $(dir $@)
-	git -C $(abspath $(TOP)) submodule update --init riscv-tools
-	rm -f $(abspath $(TOP))/riscv-tools/.travis.yml
-	git -C $(abspath $(TOP))/riscv-tools submodule update --init --recursive riscv-gnu-toolchain
-	git -C $(abspath $(TOP))/riscv-tools submodule update --init --recursive riscv-isa-sim
-	git -C $(abspath $(TOP))/riscv-tools submodule update --init --recursive riscv-fesvr
-	git -C $(abspath $(TOP))/riscv-tools submodule update --init --recursive riscv-opcodes
-	git -C $(abspath $(TOP))/riscv-tools submodule update --init --recursive riscv-pk
-	git -C $(abspath $(TOP))/riscv-tools submodule update --init --recursive riscv-tests
-	git -C $(abspath $(TOP))/riscv-tools submodule update --init --recursive riscv-openocd
-	+cd $(abspath $(TOP))/riscv-tools; RISCV=$(abspath $(RISCV)) ./build.sh
+	git -C $(abspath $(TOP)) clone -n https://github.com/freechipsproject/rocket-tools.git
+	git -C $(RISCV_TOOLS) checkout $(TOOLS_HASH)
+	git -C $(RISCV_TOOLS) submodule update --init --recursive riscv-isa-sim  riscv-tests riscv-pk riscv-openocd fsf-binutils-gdb
+	git -C $(RISCV_TOOLS) submodule update --init riscv-gnu-toolchain
+	git -C $(RISCV_TOOLS)/riscv-gnu-toolchain submodule update --init riscv-binutils-gdb riscv-gcc riscv-newlib
+	rm -f $(RISCV_TOOLS)/.travis.yml
+	mkdir -p $(dir $@)
+	date > $@
+
+# rocket-tools_checkout.stamp is an order-only prerequisite:
+# https://www.gnu.org/software/make/manual/make.html#Prerequisite-Types
+# This means that the rule will be executed, but it will /not/ be
+# evaluated as a depenency for install.stamp. This is needed because
+# the timestamp on install.stamp will be older than the checkout stamp
+# anytime we restore the installation area from cache in travisci.
+$(RISCV)/install.stamp: | stamps/rocket-tools_checkout.stamp
+	mkdir -p $(dir $@)
+	+cd $(RISCV_TOOLS); RISCV=$(abspath $(RISCV)) ./build.sh
 	date > $@
 
 # Builds the various simulators
@@ -226,7 +253,7 @@ stamps/%/emulator-torture-$(TORTURE_CONFIG).stamp: stamps/%/emulator-debug.stamp
 
 # If this is defined empty, then all tests would run.
 JTAG_DTM_TEST ?= MemTest64
-GDBSERVER = $(abspath $(TOP))/riscv-tools/riscv-tests/debug/gdbserver.py \
+GDBSERVER = $(abspath $(TOP))/rocket-tools/riscv-tests/debug/gdbserver.py \
 	    --print-failures \
 	    --print-log-names
 
@@ -248,13 +275,12 @@ endif
 
 JTAG_DTM_SIM_ARGS = +verbose +jtag_rbb_enable=1 $(SEED_ARG)
 
-stamps/riscv-tests.stamp:
-	git -C $(abspath $(TOP)) submodule update --init riscv-tools
-	git -C $(abspath $(TOP))/riscv-tools submodule update --init --recursive riscv-tests
+stamps/riscv-tests.stamp: stamps/rocket-tools_checkout.stamp
+	mkdir -p $(dir $@)
 	date > $@
 
 stamps/%/vsim-jtag-dtm-32-$(JTAG_DTM_TEST).stamp: stamps/%/vsim$(JTAG_STAMP_SUFFIX).stamp stamps/riscv-tests.stamp
-	RISCV=$(RISCV) $(GDBSERVER) \
+	RISCV=$(RISCV) PATH="$(abspath $(RISCV)/bin:$(PATH))" $(GDBSERVER) \
 	--sim_cmd="$(abspath $(TOP))/vsim/simv-$(PROJECT)-$*$(JTAG_DEBUG_SUFFIX) $(JTAG_DTM_SIM_ARGS) $(VSIM_JTAG_VCDPLUS_32)" \
 	--server_cmd="$(RISCV)/bin/openocd $(OPENOCD_DEBUG) \
 	-s $(RISCV)/share/openocd/scripts" \
@@ -264,7 +290,7 @@ stamps/%/vsim-jtag-dtm-32-$(JTAG_DTM_TEST).stamp: stamps/%/vsim$(JTAG_STAMP_SUFF
 	date > $@
 
 stamps/%/vsim-jtag-dtm-64-$(JTAG_DTM_TEST).stamp: stamps/%/vsim$(JTAG_STAMP_SUFFIX).stamp stamps/riscv-tests.stamp
-	RISCV=$(RISCV) $(GDBSERVER) \
+	RISCV=$(RISCV) PATH="$(abspath $(RISCV)/bin:$(PATH))" $(GDBSERVER) \
 	--sim_cmd="$(abspath $(TOP))/vsim/simv-$(PROJECT)-$*$(JTAG_DEBUG_SUFFIX) $(JTAG_DTM_SIM_ARGS) $(VSIM_JTAG_VCDPLUS_64)" \
 	--server_cmd="$(RISCV)/bin/openocd $(OPENOCD_DEBUG) \
 	-s $(RISCV)/share/openocd/scripts" \
@@ -274,7 +300,7 @@ stamps/%/vsim-jtag-dtm-64-$(JTAG_DTM_TEST).stamp: stamps/%/vsim$(JTAG_STAMP_SUFF
 	date > $@
 
 stamps/%/emulator-jtag-dtm-32-$(JTAG_DTM_TEST).stamp:  stamps/%/emulator$(JTAG_STAMP_SUFFIX).stamp stamps/riscv-tests.stamp
-	RISCV=$(RISCV) $(GDBSERVER) \
+	RISCV=$(RISCV) PATH="$(abspath $(RISCV)/bin:$(PATH))" $(GDBSERVER) \
 	--sim_cmd="$(abspath $(TOP))/emulator/emulator-$(PROJECT)-$*$(JTAG_DEBUG_SUFFIX) $(JTAG_DTM_SIM_ARGS) $(EMULATOR_JTAG_VCDPLUS_32) dummybin" \
 	--server_cmd="$(RISCV)/bin/openocd $(OPENOCD_DEBUG) \
 	-s $(RISCV)/share/openocd/scripts" \
@@ -284,7 +310,7 @@ stamps/%/emulator-jtag-dtm-32-$(JTAG_DTM_TEST).stamp:  stamps/%/emulator$(JTAG_S
 	date > $@
 
 stamps/%/emulator-jtag-dtm-64-$(JTAG_DTM_TEST).stamp:  stamps/%/emulator$(JTAG_STAMP_SUFFIX).stamp stamps/riscv-tests.stamp
-	RISCV=$(RISCV) $(GDBSERVER) \
+	RISCV=$(RISCV) PATH="$(abspath $(RISCV)/bin:$(PATH))" $(GDBSERVER) \
 	--sim_cmd="$(abspath $(TOP))/emulator/emulator-$(PROJECT)-$*$(JTAG_DEBUG_SUFFIX) $(JTAG_DTM_SIM_ARGS) $(EMULATOR_JTAG_VCDPLUS_64) dummybin" \
 	--server_cmd="$(RISCV)/bin/openocd $(OPENOCD_DEBUG) \
 	-s $(RISCV)/share/openocd/scripts" \

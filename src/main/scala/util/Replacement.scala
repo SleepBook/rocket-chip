@@ -4,6 +4,7 @@
 package freechips.rocketchip.util
 
 import Chisel._
+import chisel3.util.random.LFSR
 
 abstract class ReplacementPolicy {
   def way: UInt
@@ -14,9 +15,9 @@ abstract class ReplacementPolicy {
 class RandomReplacement(ways: Int) extends ReplacementPolicy {
   private val replace = Wire(Bool())
   replace := Bool(false)
-  val lfsr = LFSR16(replace)
+  val lfsr = LFSR(16, replace)
 
-  def way = if(ways == 1) UInt(0) else lfsr(log2Up(ways)-1,0)
+  def way = Random(ways, lfsr)
   def miss = replace := Bool(true)
   def hit = {}
 }
@@ -41,6 +42,9 @@ class PseudoLRU(n: Int)
   private val state_reg = Reg(UInt(width = n-1))
   def access(way: UInt) {
     state_reg := get_next_state(state_reg,way)
+  }
+  def access(ways: Seq[ValidIO[UInt]]) {
+    state_reg := ways.foldLeft(state_reg)((prev, way) => Mux(way.valid, get_next_state(prev, way.bits), prev))
   }
   def get_next_state(state: UInt, way: UInt) = {
     var next_state = state << 1

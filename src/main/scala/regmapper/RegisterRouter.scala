@@ -18,10 +18,11 @@ case class RegisterRouterParams(
   undefZero: Boolean = true,
   executable: Boolean = false)
 
-abstract class RegisterRouter[T <: Data](devParams: RegisterRouterParams)(implicit p: Parameters)
+abstract class RegisterRouter(devParams: RegisterRouterParams)(implicit p: Parameters)
     extends LazyModule
     with HasClockDomainCrossing {
 
+  require (isPow2(devParams.size))
   val address = Seq(AddressSet(devParams.base, devParams.size-1))
   val concurrency = devParams.concurrency
   val beatBytes = devParams.beatBytes

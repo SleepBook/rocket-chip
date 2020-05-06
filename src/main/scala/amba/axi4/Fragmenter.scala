@@ -6,8 +6,11 @@ import Chisel._
 import chisel3.util.IrrevocableIO
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.util.{leftOR, rightOR, UIntToOH1, OH1ToOH}
+import freechips.rocketchip.util._
 import scala.math.{min,max}
+
+case object AXI4FragLast extends ControlKey[Bool]("real_last")
+case class AXI4FragLastField() extends SimpleBundleField(AXI4FragLast)(Output(Bool()), false.B)
 
 class AXI4Fragmenter()(implicit p: Parameters) extends LazyModule
 {
@@ -18,10 +21,10 @@ class AXI4Fragmenter()(implicit p: Parameters) extends LazyModule
     supportsWrite = expandTransfer(s.supportsWrite, beatBytes, s.minAlignment),
     supportsRead  = expandTransfer(s.supportsRead,  beatBytes, s.minAlignment),
     interleavedId = None) // this breaks interleaving guarantees
-  def mapMaster(m: AXI4MasterParameters) = m.copy(aligned = true)
+  def mapMaster(m: AXI4MasterParameters) = m.copy(aligned = true, maxFlight = None)
 
   val node = AXI4AdapterNode(
-    masterFn = { mp => mp.copy(masters = mp.masters.map(m => mapMaster(m)), userBits = mp.userBits + 1) },
+    masterFn = { mp => mp.copy(masters = mp.masters.map(m => mapMaster(m)), echoFields = AXI4FragLastField() +: mp.echoFields) },
     slaveFn  = { sp => sp.copy(slaves  = sp.slaves .map(s => mapSlave(s, sp.beatBytes))) })
 
   lazy val module = new LazyModuleImp(this) {
@@ -63,8 +66,8 @@ class AXI4Fragmenter()(implicit p: Parameters) extends LazyModule
         val addr = Mux(busy, r_addr, a.bits.addr)
 
         val lo = if (lgBytes == 0) UInt(0) else addr(lgBytes-1, 0)
-        val hi = addr >> lgBytes
-        val alignment = hi(AXI4Parameters.lenBits-1,0)
+        val cutoff = AXI4Parameters.lenBits + lgBytes
+        val alignment = addr((a.bits.params.addrBits min cutoff)-1, lgBytes)
 
         // We don't care about illegal addresses; bursts or no bursts... whatever circuit is simpler (AXI4ToTL will fix it)
         // !!! think about this more -- what if illegal?
@@ -109,7 +112,7 @@ class AXI4Fragmenter()(implicit p: Parameters) extends LazyModule
         a.ready := out.ready && last
         out.valid := a.valid
 
-        out.bits := a.bits
+        out.bits :<= a.bits
         out.bits.len := beats1
 
         // We forcibly align every access. If the first beat was misaligned, the strb bits
@@ -141,8 +144,8 @@ class AXI4Fragmenter()(implicit p: Parameters) extends LazyModule
       val in_w = Queue.irrevocable(in.w, 1, flow=true)
 
       // AR flow control; super easy
-      out.ar <> in_ar
-      out.ar.bits.user.get := Cat(in_ar.bits.user.toList ++ Seq(ar_last))
+      out.ar :<>: in_ar
+      out.ar.bits.echo(AXI4FragLast) := ar_last
 
       // When does W channel start counting a new transfer
       val wbeats_latched = RegInit(Bool(false))
@@ -155,8 +158,8 @@ class AXI4Fragmenter()(implicit p: Parameters) extends LazyModule
       out.aw.valid := in_aw.valid && (wbeats_ready || wbeats_latched)
       in_aw.ready := out.aw.ready && (wbeats_ready || wbeats_latched)
       wbeats_valid := in_aw.valid && !wbeats_latched
-      out.aw.bits := in_aw.bits
-      out.aw.bits.user.get := Cat(in_aw.bits.user.toList ++ Seq(aw_last))
+      out.aw.bits :<>: in_aw.bits
+      out.aw.bits.echo(AXI4FragLast) := aw_last
 
       // We need to inject 'last' into the W channel fragments, count!
       val w_counter = RegInit(UInt(0, width = AXI4Parameters.lenBits+1))
@@ -170,28 +173,26 @@ class AXI4Fragmenter()(implicit p: Parameters) extends LazyModule
       wbeats_ready := w_idle
       out.w.valid := in_w.valid && (!wbeats_ready || wbeats_valid)
       in_w.ready := out.w.ready && (!wbeats_ready || wbeats_valid)
-      out.w.bits := in_w.bits
+      out.w.bits :<= in_w.bits
       out.w.bits.last := w_last
       // We should also recreate the last last
       assert (!out.w.valid || !in_w.bits.last || w_last)
 
       // R flow control
-      val r_last = out.r.bits.user.get(0)
-      in.r <> out.r
+      val r_last = out.r.bits.echo(AXI4FragLast)
+      in.r :<> out.r
       in.r.bits.last := out.r.bits.last && r_last
-      in.r.bits.user.foreach { _ := out.r.bits.user.get >> 1 }
 
       // B flow control
-      val b_last = out.b.bits.user.get(0)
-      in.b <> out.b
+      val b_last = out.b.bits.echo(AXI4FragLast)
+      in.b :<> out.b
       in.b.valid := out.b.valid && b_last
       out.b.ready := in.b.ready || !b_last
-      in.b.bits.user.foreach { _ := out.b.bits.user.get >> 1 }
 
       // Merge errors from dropped B responses
       val error = RegInit(Vec.fill(edgeIn.master.endId) { UInt(0, width = AXI4Parameters.respBits)})
       in.b.bits.resp := out.b.bits.resp | error(out.b.bits.id)
-      (error zip UIntToOH(out.b.bits.id, edgeIn.master.endId).toBools) foreach { case (reg, sel) =>
+      (error zip UIntToOH(out.b.bits.id, edgeIn.master.endId).asBools) foreach { case (reg, sel) =>
         when (sel && out.b.fire()) { reg := Mux(b_last, UInt(0), reg | out.b.bits.resp) }
       }
     }

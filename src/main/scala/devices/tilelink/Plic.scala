@@ -2,10 +2,11 @@
 
 package freechips.rocketchip.devices.tilelink
 
-import Chisel._
+import Chisel.{defaultCompileOptions => _, _}
+import freechips.rocketchip.util.CompileOptions.NotStrictInferReset
 import Chisel.ImplicitConversions._
 import freechips.rocketchip.config.{Field, Parameters}
-import freechips.rocketchip.subsystem.BaseSubsystem
+import freechips.rocketchip.subsystem._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.regmapper._
 import freechips.rocketchip.tilelink._
@@ -13,6 +14,8 @@ import freechips.rocketchip.interrupts._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property._
 import chisel3.internal.sourceinfo.SourceInfo
+import freechips.rocketchip.diplomaticobjectmodel.model._
+
 import scala.math.min
 
 class GatewayPLICIO extends Bundle {
@@ -36,7 +39,7 @@ class LevelGateway extends Module {
 object PLICConsts
 {
   def maxDevices = 1023
-  def maxHarts = 15872
+  def maxMaxHarts = 15872
   def priorityBase = 0x0
   def pendingBase = 0x1000
   def enableBase = 0x2000
@@ -50,23 +53,33 @@ object PLICConsts
   def enableBase(i: Int):Int = enableOffset(i) + enableBase
   def hartBase(i: Int):Int = hartOffset(i) + hartBase
 
-  def size = hartBase(maxHarts)
-  require(hartBase >= enableBase(maxHarts))
+  def size(maxHarts: Int): Int = {
+    require(maxHarts > 0 && maxHarts <= maxMaxHarts, s"Must be: maxHarts=$maxHarts > 0 && maxHarts <= PLICConsts.maxMaxHarts=${PLICConsts.maxMaxHarts}")
+    1 << log2Ceil(hartBase(maxHarts))
+  }
+
+  require(hartBase >= enableBase(maxMaxHarts))
 }
 
-case class PLICParams(baseAddress: BigInt = 0xC000000, maxPriorities: Int = 7, intStages: Int = 0)
+case class PLICParams(baseAddress: BigInt = 0xC000000, maxPriorities: Int = 7, intStages: Int = 0, maxHarts: Int = PLICConsts.maxMaxHarts)
 {
   require (maxPriorities >= 0)
-  def address = AddressSet(baseAddress, PLICConsts.size-1)
+  def address = AddressSet(baseAddress, PLICConsts.size(maxHarts)-1)
 }
 
 case object PLICKey extends Field[Option[PLICParams]](None)
+
+case class PLICAttachParams(
+  slaveWhere: TLBusWrapperLocation = CBUS
+)
+
+case object PLICAttachKey extends Field(PLICAttachParams())
 
 /** Platform-Level Interrupt Controller */
 class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends LazyModule
 {
   // plic0 => max devices 1023
-  val device = new SimpleDevice("interrupt-controller", Seq("riscv,plic0")) {
+  val device: SimpleDevice = new SimpleDevice("interrupt-controller", Seq("riscv,plic0")) {
     override val alwaysExtended = true
     override def describe(resources: ResourceBindings): Description = {
       val Description(name, mapping) = super.describe(resources)
@@ -79,14 +92,14 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     }
   }
 
-  val node = TLRegisterNode(
+  val node : TLRegisterNode = TLRegisterNode(
     address   = Seq(params.address),
     device    = device,
     beatBytes = beatBytes,
     undefZero = true,
     concurrency = 1) // limiting concurrency handles RAW hazards on claim registers
 
-  val intnode = IntNexusNode(
+  val intnode: IntNexusNode = IntNexusNode(
     sourceFn = { _ => IntSourcePortParameters(Seq(IntSourceParameters(1, Seq(Resource(device, "int"))))) },
     sinkFn   = { _ => IntSinkPortParameters(Seq(IntSinkParameters())) },
     outputRequiresInput = false,
@@ -122,6 +135,8 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     // This flattens the harts into an MSMSMSMSMS... or MMMMM.... sequence
     val harts = io_harts.flatten
 
+    def getNInterrupts = interrupts.size
+
     println(s"Interrupt map (${nHarts} harts ${nDevices} interrupts):")
     flatSources.foreach { s =>
       // +1 because 0 is reserved, +1-1 because the range is half-open
@@ -133,7 +148,7 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     require (nHarts == harts.size, s"Must be: nHarts=$nHarts == harts.size=${harts.size}")
 
     require(nDevices <= PLICConsts.maxDevices, s"Must be: nDevices=$nDevices <= PLICConsts.maxDevices=${PLICConsts.maxDevices}")
-    require(nHarts > 0 && nHarts <= PLICConsts.maxHarts, s"Must be: nHarts=$nHarts > 0 && nHarts <= PLICConsts.maxHarts=${PLICConsts.maxHarts}")
+    require(nHarts > 0 && nHarts <= params.maxHarts, s"Must be: nHarts=$nHarts > 0 && nHarts <= PLICParams.maxHarts=${params.maxHarts}")
 
     // For now, use LevelGateways for all TL2 interrupts
     val gateways = interrupts.map { case i =>
@@ -145,11 +160,11 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     val prioBits = log2Ceil(nPriorities+1)
     val priority =
       if (nPriorities > 0) Reg(Vec(nDevices, UInt(width=prioBits)))
-      else Wire(init=Vec.fill(nDevices)(UInt(1)))
+      else Wire(init=Vec.fill(nDevices max 1)(UInt(1)))
     val threshold =
       if (nPriorities > 0) Reg(Vec(nHarts, UInt(width=prioBits)))
       else Wire(init=Vec.fill(nHarts)(UInt(0)))
-    val pending = Reg(init=Vec.fill(nDevices){Bool(false)})
+    val pending = Reg(init=Vec.fill(nDevices max 1){Bool(false)})
 
     /* Construct the enable registers, chunked into 8-bit segments to reduce verilog size */
     val firstEnable = nDevices min 7
@@ -222,7 +237,7 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     val claimer = Wire(Vec(nHarts, Bool()))
     assert((claimer.asUInt & (claimer.asUInt - UInt(1))) === UInt(0)) // One-Hot
     val claiming = Seq.tabulate(nHarts){i => Mux(claimer(i), maxDevs(i), UInt(0))}.reduceLeft(_|_)
-    val claimedDevs = Vec(UIntToOH(claiming, nDevices+1).toBools)
+    val claimedDevs = Vec(UIntToOH(claiming, nDevices+1).asBools)
 
     ((pending zip gateways) zip claimedDevs.tail) foreach { case ((p, g), c) =>
       g.ready := !p
@@ -240,7 +255,7 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     assert((completer.asUInt & (completer.asUInt - UInt(1))) === UInt(0)) // One-Hot
     val completerDev = Wire(UInt(width = log2Up(nDevices + 1)))
     val completedDevs = Mux(completer.reduce(_ || _), UIntToOH(completerDev, nDevices+1), UInt(0))
-    (gateways zip completedDevs.toBools.tail) foreach { case (g, c) =>
+    (gateways zip completedDevs.asBools.tail) foreach { case (g, c) =>
        g.complete := c
     }
 
@@ -284,7 +299,7 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
       )
     }
 
-    node.regmap((priorityRegFields ++ pendingRegFields ++ enableRegFields ++ hartRegFields):_*)
+    val omRegMap : OMRegisterMap = node.regmap((priorityRegFields ++ pendingRegFields ++ enableRegFields ++ hartRegFields):_*)
 
     if (nDevices >= 2) {
       val claimed = claimer(0) && maxDevs(0) > 0
@@ -324,7 +339,7 @@ class PLICFanIn(nDevices: Int, prioBits: Int) extends Module {
     } else (x.head, UInt(0))
   }
 
-  val effectivePriority = (UInt(1) << prioBits) +: (io.ip.toBools zip io.prio).map { case (p, x) => Cat(p, x) }
+  val effectivePriority = (UInt(1) << prioBits) +: (io.ip.asBools zip io.prio).map { case (p, x) => Cat(p, x) }
   val (maxPri, maxDev) = findMax(effectivePriority)
   io.max := maxPri // strips the always-constant high '1' bit
   io.dev := maxDev
@@ -333,8 +348,9 @@ class PLICFanIn(nDevices: Int, prioBits: Int) extends Module {
 /** Trait that will connect a PLIC to a subsystem */
 trait CanHavePeripheryPLIC { this: BaseSubsystem =>
   val plicOpt  = p(PLICKey).map { params =>
-    val plic = LazyModule(new TLPLIC(params, sbus.control_bus.beatBytes))
-    sbus.control_bus.toVariableWidthSlave(Some("plic")) { plic.node }
+    val tlbus = locateTLBusWrapper(p(PLICAttachKey).slaveWhere)
+    val plic = LazyModule(new TLPLIC(params, tlbus.beatBytes))
+    plic.node := tlbus.coupleTo("plic") { TLFragmenter(tlbus) := _ }
     plic.intnode :=* ibus.toPLIC
     plic
   }

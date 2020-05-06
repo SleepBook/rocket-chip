@@ -6,6 +6,7 @@ import Chisel._
 import chisel3.internal.sourceinfo.SourceInfo
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.util._
 import scala.math.max
 
 case class APBSlaveParameters(
@@ -15,7 +16,8 @@ case class APBSlaveParameters(
   executable:    Boolean       = false, // processor can execute from this memory
   nodePath:      Seq[BaseNode] = Seq(),
   supportsWrite: Boolean       = true,
-  supportsRead:  Boolean       = true)
+  supportsRead:  Boolean       = true,
+  device: Option[Device] = None)
 {
   address.foreach { a => require (a.finite) }
     address.combinations(2).foreach { case Seq(x,y) => require (!x.overlaps(y)) }
@@ -23,11 +25,22 @@ case class APBSlaveParameters(
   val name = nodePath.lastOption.map(_.lazyModule.name).getOrElse("disconnected")
   val maxAddress = address.map(_.max).max
   val minAlignment = address.map(_.alignment).min
+
+  def toResource: ResourceAddress = {
+    ResourceAddress(address, ResourcePermissions(
+      r = supportsRead,
+      w = supportsWrite,
+      x = executable,
+      c = false,
+      a = false))
+  }
 }
 
 case class APBSlavePortParameters(
   slaves:    Seq[APBSlaveParameters],
-  beatBytes: Int)
+  beatBytes: Int,
+  responseFields: Seq[BundleFieldBase] = Nil,
+  requestKeys:    Seq[BundleKeyBase]   = Nil)
 {
   require (!slaves.isEmpty)
   require (isPow2(beatBytes))
@@ -43,15 +56,19 @@ case class APBSlavePortParameters(
 }
 
 case class APBMasterParameters(
-  name:     String,
-  nodePath: Seq[BaseNode] = Seq())
+  name:       String,
+  nodePath:   Seq[BaseNode] = Seq())
 
 case class APBMasterPortParameters(
-  masters: Seq[APBMasterParameters])
+  masters: Seq[APBMasterParameters],
+  requestFields: Seq[BundleFieldBase] = Nil,
+  responseKeys:  Seq[BundleKeyBase]   = Nil)
 
 case class APBBundleParameters(
   addrBits: Int,
-  dataBits: Int)
+  dataBits: Int,
+  requestFields:  Seq[BundleFieldBase] = Nil,
+  responseFields: Seq[BundleFieldBase] = Nil)
 {
   require (dataBits >= 8)
   require (addrBits >= 1)
@@ -63,18 +80,22 @@ case class APBBundleParameters(
   def union(x: APBBundleParameters) =
     APBBundleParameters(
       max(addrBits, x.addrBits),
-      max(dataBits, x.dataBits))
+      max(dataBits, x.dataBits),
+      BundleField.union(requestFields  ++ x.requestFields),
+      BundleField.union(responseFields ++ x.responseFields))
 }
 
 object APBBundleParameters
 {
-  val emptyBundleParams = APBBundleParameters(addrBits = 1, dataBits = 8)
+  val emptyBundleParams = APBBundleParameters(addrBits = 1, dataBits = 8, requestFields = Nil, responseFields = Nil)
   def union(x: Seq[APBBundleParameters]) = x.foldLeft(emptyBundleParams)((x,y) => x.union(y))
 
   def apply(master: APBMasterPortParameters, slave: APBSlavePortParameters) =
     new APBBundleParameters(
-      addrBits = log2Up(slave.maxAddress+1),
-      dataBits = slave.beatBytes * 8)
+      addrBits   = log2Up(slave.maxAddress+1),
+      dataBits   = slave.beatBytes * 8,
+      requestFields  = BundleField.accept(master.requestFields, slave.requestKeys),
+      responseFields = BundleField.accept(slave.responseFields, master.responseKeys))
 }
 
 case class APBEdgeParameters(

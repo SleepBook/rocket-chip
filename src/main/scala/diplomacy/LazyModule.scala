@@ -2,8 +2,9 @@
 
 package freechips.rocketchip.diplomacy
 
-import Chisel._
-import chisel3.experimental.{BaseModule, RawModule, MultiIOModule, withClockAndReset}
+import Chisel.{defaultCompileOptions => _, _}
+import freechips.rocketchip.util.CompileOptions.NotStrictInferReset
+import chisel3.{RawModule, MultiIOModule, withClockAndReset, Reset}
 import chisel3.internal.sourceinfo.{SourceInfo, SourceLine, UnlocatableSourceInfo}
 import freechips.rocketchip.config.Parameters
 import scala.collection.immutable.{SortedMap,ListMap}
@@ -80,7 +81,7 @@ abstract class LazyModule()(implicit val p: Parameters)
     nodes.filter(!_.omitGraphML).foreach { n =>
       buf ++= s"""${pad}    <node id=\"${index}::${n.index}\">\n"""
       buf ++= s"""${pad}      <data key=\"e\"><y:ShapeNode><y:Shape type="Ellipse"/></y:ShapeNode></data>\n"""
-      buf ++= s"""${pad}      <data key=\"d\">${n.nodedebugstring}</data>\n"""
+      buf ++= s"""${pad}      <data key=\"d\">${n.formatNode}, \n${n.nodedebugstring}</data>\n"""
       buf ++= s"""${pad}    </node>\n"""
     }
     children.filter(!_.omitGraphML).foreach { _.nodesGraphML(buf, pad + "    ") }
@@ -112,12 +113,19 @@ abstract class LazyModule()(implicit val p: Parameters)
     children.filter(!_.omitGraphML).foreach { c => c.edgesGraphML(buf, pad) }
   }
 
-  def nodeIterator(iterfunc: (LazyModule) => Unit): Unit = {
+  def childrenIterator(iterfunc: (LazyModule) => Unit): Unit = {
     iterfunc(this)
-    children.foreach( _.nodeIterator(iterfunc) )
+    children.foreach( _.childrenIterator(iterfunc) )
+  }
+
+  def nodeIterator(iterfunc: (BaseNode) => Unit): Unit = {
+    nodes.foreach(iterfunc)
+    childrenIterator(_.nodes.foreach(iterfunc))
   }
 
   def getChildren = children
+
+  def getNodes = nodes
 }
 
 object LazyModule
@@ -191,9 +199,9 @@ class LazyRawModuleImp(val wrapper: LazyModule) extends RawModule with LazyModul
   // It is recommended to drive these even if you manually shove most of your children
   // Otherwise, anonymous children (Monitors for example) will not be clocked
   val childClock = Wire(Clock())
-  val childReset = Wire(Bool())
+  val childReset = Wire(Reset())
   childClock := Bool(false).asClock
-  childReset := Bool(true)
+  childReset := chisel3.DontCare
   val (auto, dangles) = withClockAndReset(childClock, childReset) {
     instantiate()
   }
@@ -207,6 +215,7 @@ class SimpleLazyModule(implicit p: Parameters) extends LazyModule
 trait LazyScope
 {
   this: LazyModule =>
+  override def toString: String = s"LazyScope named $name"
   def apply[T](body: => T) = {
     val saved = LazyModule.scope
     LazyModule.scope = Some(this)

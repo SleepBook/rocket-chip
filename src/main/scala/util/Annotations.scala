@@ -4,7 +4,8 @@ package freechips.rocketchip.util
 
 import Chisel._
 import chisel3.internal.InstanceId
-import chisel3.experimental.{annotate, ChiselAnnotation, RawModule}
+import chisel3.experimental.{annotate, ChiselAnnotation}
+import chisel3.RawModule
 import firrtl.annotations._
 
 import freechips.rocketchip.diplomacy._
@@ -19,7 +20,7 @@ case class SRAMAnnotation(target: Named,
   address_width: Int,
   name: String,
   data_width: Int,
-  depth: Int,
+  depth: BigInt,
   description: String,
   write_mask_granularity: Int) extends SingleTargetAnnotation[Named] {
   def duplicate(n: Named) = this.copy(n)
@@ -109,7 +110,7 @@ object Annotated {
     name: String,
     address_width: Int,
     data_width: Int,
-    depth: Int,
+    depth: BigInt,
     description: String,
     write_mask_granularity: Int): Unit = {
     annotate(new ChiselAnnotation {def toFirrtl: Annotation = SRAMAnnotation(
@@ -171,7 +172,7 @@ trait DontTouch { self: RawModule =>
   // TODO: this is a workaround for firrtl #756
   def dontTouch(data: Data): Unit = data match {
      case agg: Aggregate => agg.getElements.foreach(dontTouch)
-     case elt: Element => chisel3.core.dontTouch(elt)
+     case elt: Element => chisel3.dontTouch(elt)
   }
 
   /** Marks every port as don't touch

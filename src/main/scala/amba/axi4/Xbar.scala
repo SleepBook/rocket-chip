@@ -6,6 +6,7 @@ import Chisel._
 import chisel3.util.IrrevocableIO
 import freechips.rocketchip.config._
 import freechips.rocketchip.diplomacy._
+import freechips.rocketchip.util._
 import freechips.rocketchip.unittest._
 import freechips.rocketchip.tilelink._
 
@@ -20,7 +21,9 @@ class AXI4Xbar(
   val node = AXI4NexusNode(
     masterFn  = { seq =>
       seq(0).copy(
-        userBits = seq.map(_.userBits).max,
+        echoFields    = BundleField.union(seq.flatMap(_.echoFields)),
+        requestFields = BundleField.union(seq.flatMap(_.requestFields)),
+        responseKeys  = seq.flatMap(_.responseKeys).distinct,
         masters = (AXI4Xbar.mapInputIds(seq) zip seq) flatMap { case (range, port) =>
           port.masters map { master => master.copy(id = master.id.shift(range.start)) }
         }
@@ -28,8 +31,9 @@ class AXI4Xbar(
     },
     slaveFn = { seq =>
       seq(0).copy(
+        responseFields = BundleField.union(seq.flatMap(_.responseFields)),
+        requestKeys    = seq.flatMap(_.requestKeys).distinct,
         minLatency = seq.map(_.minLatency).min,
-        wcorrupt = seq.exists(_.wcorrupt),
         slaves = seq.flatMap { port =>
           require (port.beatBytes == seq(0).beatBytes,
             s"Xbar data widths don't match: ${port.slaves.map(_.name)} has ${port.beatBytes}B vs ${seq(0).slaves.map(_.name)} has ${seq(0).beatBytes}B")
@@ -62,7 +66,7 @@ class AXI4Xbar(
 
     // W follows the path dictated by the AW Q
     for (i <- 0 until io_in.size) { awIn(i).io.enq.bits := requestAWIO(i).asUInt }
-    val requestWIO = awIn.map { q => if (io_out.size > 1) q.io.deq.bits.toBools else Seq(Bool(true)) }
+    val requestWIO = awIn.map { q => if (io_out.size > 1) q.io.deq.bits.asBools else Seq(Bool(true)) }
 
     // We need an intermediate size of bundle with the widest possible identifiers
     val wide_bundle = AXI4BundleParameters.union(io_in.map(_.params) ++ io_out.map(_.params))
@@ -70,7 +74,7 @@ class AXI4Xbar(
     // Transform input bundles
     val in = Wire(Vec(io_in.size, AXI4Bundle(wide_bundle)))
     for (i <- 0 until in.size) {
-      in(i) <> io_in(i)
+      in(i) :<> io_in(i)
 
       // Handle size = 1 gracefully (Chisel3 empty range is broken)
       def trim(id: UInt, size: Int) = if (size <= 1) UInt(0) else id(log2Ceil(size)-1, 0)
@@ -151,7 +155,7 @@ class AXI4Xbar(
     // Transform output bundles
     val out = Wire(Vec(io_out.size, AXI4Bundle(wide_bundle)))
     for (i <- 0 until out.size) {
-      io_out(i) <> out(i)
+      io_out(i) :<> out(i)
 
       if (io_in.size > 1) {
         // Block AW if we cannot record the W source
@@ -184,7 +188,7 @@ class AXI4Xbar(
       AXI4Arbiter(arbitrationPolicy)(out(o).ar, portsAROI(o):_*)
       // W arbitration is informed by the Q, not policy
       out(o).w.valid := Mux1H(awOut(o).io.deq.bits, portsWOI(o).map(_.valid))
-      out(o).w.bits  := Mux1H(awOut(o).io.deq.bits, portsWOI(o).map(_.bits))
+      out(o).w.bits :<= Mux1H(awOut(o).io.deq.bits, portsWOI(o).map(_.bits))
       portsWOI(o).zipWithIndex.map { case (p, i) =>
         if (in.size > 1) {
           p.ready := out(o).w.ready && awOut(o).io.deq.bits(i)
@@ -218,7 +222,7 @@ object AXI4Xbar
   def fanout[T <: AXI4BundleBase](input: IrrevocableIO[T], select: Seq[Bool]) = {
     val filtered = Wire(Vec(select.size, input))
     for (i <- 0 until select.size) {
-      filtered(i).bits := input.bits
+      filtered(i).bits :<= input.bits
       filtered(i).valid := input.valid && select(i)
     }
     input.ready := Mux1H(select, filtered.map(_.ready))
@@ -245,7 +249,7 @@ object AXI4Arbiter
     val valids = sources.map(_.valid)
     val anyValid = valids.reduce(_ || _)
     // Arbitrate amongst the requests
-    val readys = Vec(policy(valids.size, Cat(valids.reverse), idle).toBools)
+    val readys = Vec(policy(valids.size, Cat(valids.reverse), idle).asBools)
     // Which request wins arbitration?
     val winner = Vec((readys zip valids) map { case (r,v) => r&&v })
 
@@ -276,7 +280,7 @@ object AXI4Arbiter
     }
 
     sink.valid := Mux(idle, anyValid, Mux1H(state, valids))
-    sink.bits := Mux1H(muxState, sources.map(_.bits))
+    sink.bits :<= Mux1H(muxState, sources.map(_.bits))
     muxState
   }
 }

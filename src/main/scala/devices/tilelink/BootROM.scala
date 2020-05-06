@@ -23,8 +23,8 @@ case object BootROMParams extends Field[BootROMParams]
 class TLROM(val base: BigInt, val size: Int, contentsDelayed: => Seq[Byte], executable: Boolean = true, beatBytes: Int = 4,
   resources: Seq[Resource] = new SimpleDevice("rom", Seq("sifive,rom0")).reg("mem"))(implicit p: Parameters) extends LazyModule
 {
-  val node = TLManagerNode(Seq(TLManagerPortParameters(
-    Seq(TLManagerParameters(
+  val node = TLManagerNode(Seq(TLSlavePortParameters.v1(
+    Seq(TLSlaveParameters.v1(
       address     = List(AddressSet(base, size-1)),
       resources   = resources,
       regionType  = RegionType.UNCACHED,
@@ -69,9 +69,9 @@ trait HasPeripheryBootROM { this: BaseSubsystem =>
   }
   def resetVector: BigInt = params.hang
 
-  val bootrom = LazyModule(new TLROM(params.address, params.size, contents, true, sbus.control_bus.beatBytes))
+  val bootrom = LazyModule(new TLROM(params.address, params.size, contents, true, cbus.beatBytes))
 
-  sbus.control_bus.toVariableWidthSlave(Some("bootrom")){ bootrom.node }
+  bootrom.node := cbus.coupleTo("bootrom"){ TLFragmenter(cbus) := _ }
 }
 
 /** Subsystem will power-on running at 0x10040 (BootROM) */
